@@ -72,20 +72,21 @@ def dispatch(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         x_to_send = x[indices_to_send]
         sf_to_send = sf[indices_to_send] if use_fp8 else None
         topk_idx_to_send = topk_idx[indices_to_send]
-        topk_weights_to_send = topk_weights[indices_to_send]
+        topk_weights_to_send = topk_weights[indices_to_send] if topk_weights is not None else None
         masked_topk_idx = torch.where((expert_start_idx <= topk_idx_to_send) & (topk_idx_to_send < expert_end_idx),
                                       topk_idx_to_send, torch.full_like(topk_idx_to_send, -1))
 
         send_x_list.append(x_to_send)
         send_sf_list.append(sf_to_send)
         send_topk_idx_list.append(masked_topk_idx)
-        send_topk_weights_list.append(topk_weights_to_send)
+        if topk_weights_to_send is not None:
+            send_topk_weights_list.append(topk_weights_to_send)
         send_src_token_idx_list.append(indices_to_send)
 
     send_x = torch.cat(send_x_list, dim=0)
     send_sf = torch.cat(send_sf_list, dim=0) if use_fp8 else None
     send_topk_idx = torch.cat(send_topk_idx_list, dim=0)
-    send_topk_weights = torch.cat(send_topk_weights_list, dim=0)
+    send_topk_weights = torch.cat(send_topk_weights_list, dim=0) if topk_weights is not None else None
     send_src_token_idx = torch.cat(send_src_token_idx_list, dim=0).to(torch.int)
     send_src_token_idx += rank_idx * num_max_tokens_per_rank
 
@@ -100,13 +101,15 @@ def dispatch(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     recv_x = torch.empty((num_recv_tokens, hidden), dtype=x.dtype, device=x.device)
     recv_sf = torch.empty((num_recv_tokens, num_sf_packs), dtype=sf.dtype, device=x.device) if use_fp8 else None
     recv_topk_idx = torch.empty((num_recv_tokens, num_topk), dtype=topk_idx.dtype, device=x.device)
-    recv_topk_weights = torch.empty((num_recv_tokens, num_topk), dtype=topk_weights.dtype, device=x.device)
+    recv_topk_weights = torch.empty((num_recv_tokens, num_topk), dtype=topk_weights.dtype, device=x.device) \
+        if topk_weights is not None else None
     recv_src_token_idx = torch.empty((num_recv_tokens, ), dtype=torch.int, device=x.device)
     dist.all_to_all_single(recv_x, send_x, num_recv_tokens_per_rank, num_send_tokens_per_rank)
     if use_fp8:
         dist.all_to_all_single(recv_sf, send_sf, num_recv_tokens_per_rank, num_send_tokens_per_rank)
     dist.all_to_all_single(recv_topk_idx, send_topk_idx, num_recv_tokens_per_rank, num_send_tokens_per_rank)
-    dist.all_to_all_single(recv_topk_weights, send_topk_weights, num_recv_tokens_per_rank, num_send_tokens_per_rank)
+    if topk_weights is not None:
+        dist.all_to_all_single(recv_topk_weights, send_topk_weights, num_recv_tokens_per_rank, num_send_tokens_per_rank)
     dist.all_to_all_single(recv_src_token_idx, send_src_token_idx, num_recv_tokens_per_rank, num_send_tokens_per_rank)
 
     # Mask top-k indices
