@@ -61,7 +61,13 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         else:
             local_storage = local_bf16
         local_storages.append(local_storage)
-    buffer.write(local_storages, sfs=sfs)
+    write_storages = [storage.cpu() for storage in local_storages] if args.cpu_staging else local_storages
+    buffer.write(write_storages, sfs=sfs)
+    if args.cpu_staging:
+        # write() owns a completed byte copy, not a reference to caller staging.
+        # Mutate the source immediately; fetch must still match the NPU reference.
+        for storage in write_storages:
+            storage.view(torch.uint8).zero_()
 
     # Generate random indices with a per-layer global entry range
     def generate_indices():
@@ -108,28 +114,29 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                         assert torch.equal(ref_sfs[layer_idx], fetched_sf), \
                             f'fp8 scaling-factor mismatch ({layer_idx=})'
 
-    # Performance test
-    dist_print('Running performance test ...', once_in_node=True)
-    indices = generate_indices()
+    if not args.skip_performance:
+        # Performance test
+        dist_print('Running performance test ...', once_in_node=True)
+        indices = generate_indices()
 
-    def fetch_and_wait():
-        hooks = buffer.fetch(
-            indices, num_qps=args.num_qps,
-            use_tma_aligned_col_major_sf=True)
-        for hook in hooks:
-            hook()
+        def fetch_and_wait():
+            hooks = buffer.fetch(
+                indices, num_qps=args.num_qps,
+                use_tma_aligned_col_major_sf=True)
+            for hook in hooks:
+                hook()
 
-    profile = bench_msprof(
-        fetch_and_wait,
-        kernel_names='engram_fetch_impl',
-        num_warmups=10, num_tests=50, flush_l2=True,
-        barrier_comm_profiling=True, barrier=buffer.barrier)
-    num_fetched_bytes = num_layers * args.num_tokens * args.num_entries_per_token * args.hidden * dtype.itemsize
-    dist_print(
-        f'Rank {rank_idx}: {profile.us:.1f} us, '
-        f'{profile.gbps(num_fetched_bytes):.2f} GB/s, ')
+        profile = bench_msprof(
+            fetch_and_wait,
+            kernel_names='engram_fetch_impl',
+            num_warmups=10, num_tests=50, flush_l2=True,
+            barrier_comm_profiling=True, barrier=buffer.barrier)
+        num_fetched_bytes = num_layers * args.num_tokens * args.num_entries_per_token * args.hidden * dtype.itemsize
+        dist_print(
+            f'Rank {rank_idx}: {profile.us:.1f} us, '
+            f'{profile.gbps(num_fetched_bytes):.2f} GB/s, ')
 
-    dist_print(once_in_node=True)
+        dist_print(once_in_node=True)
 
     buffer.destroy()
     dist.destroy_process_group()
@@ -147,6 +154,8 @@ if __name__ == '__main__':
                         help='Number of entries concatenated per token')
     parser.add_argument('--skip-check', action='store_true', help='Skip correctness check')
     parser.add_argument('--use-fp8', action='store_true', help='Store entries in FP8 with scaling factors')
+    parser.add_argument('--cpu-staging', action='store_true', help='Stage write inputs on CPU; runtime tables remain on NPU')
+    parser.add_argument('--skip-performance', action='store_true', help='Run correctness checks without the profiler benchmark')
     args = parser.parse_args()
 
     torch.multiprocessing.spawn(test_loop, args=(args.num_processes, args), nprocs=args.num_processes)
