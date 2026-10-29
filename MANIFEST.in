@@ -1,0 +1,3 @@
+include build_support.py
+recursive-include csrc *.cpp *.h *.hpp
+recursive-include third-party/deep_jit/include *.h *.hpp

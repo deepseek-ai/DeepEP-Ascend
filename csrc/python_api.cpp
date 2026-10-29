@@ -6,6 +6,7 @@
 #include "buffers/bucket.hpp"
 #include "buffers/engram.hpp"
 #include "buffers/ep.hpp"
+#include "buffers/low_latency_api.hpp"
 #include "buffers/pp.hpp"
 #include "comm/api.hpp"
 #include "runtime/jit.hpp"
@@ -29,6 +30,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     comm::register_apis(m);
     base::register_apis(m);
+
+    py::class_<LowLatencyBuffer, BufferBase>(m, "LowLatencyBuffer")
+        .def(py::init<int, int, std::string, bool, int, int, bool>())
+        .def_readonly("context", &LowLatencyBuffer::context);
+    low_latency::register_apis(m);
 
     py::class_<EPBuffer, BufferBase>(m, "EPBuffer")
         .def(py::init<int, int, std::string, int64_t, int64_t, bool, int, int, bool>())

@@ -40,7 +40,8 @@ static void launch_dispatch(void* x, void* sf,
                             const int& num_ub_bytes,
                             const int& num_vec_cores,
                             const int64_t& num_timeout_cycles,
-                            const bool& do_barrier = false) {
+                            const bool& do_barrier = false,
+                            const bool& low_latency_transport = false) {
     // Calculate configs
     EP_HOST_ASSERT(num_vec_cores > 0);
     EP_HOST_ASSERT(num_max_tokens_per_rank > 0);
@@ -49,19 +50,19 @@ static void launch_dispatch(void* x, void* sf,
     EP_HOST_ASSERT(16 <= num_vec_cores);
 
     // Compile
-    const auto kernel = jit->compile("dispatch", std::format(R"(
+    const auto kernel = jit->compile(low_latency_transport ? "dispatch_mte" : "dispatch", std::format(R"(
 #include <deep_ep/impls/ep/dispatch.hpp>
 
 using namespace deep_ep;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )", num_ranks, num_experts, num_topk,
         expert_alignment, cached_mode, do_cpu_sync,
         num_vec_cores,
         num_hidden_bytes, num_sf_packs, num_max_tokens_per_rank, num_ub_bytes,
-        num_timeout_cycles, do_barrier));
+        num_timeout_cycles, do_barrier, low_latency_transport));
 
     // Launch
     jit->launch(

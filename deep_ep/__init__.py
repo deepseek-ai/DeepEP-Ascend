@@ -29,6 +29,7 @@ from .comm import destroy_all_managed_hccl_comm, get_physical_domain_size, get_l
 from .buffers.allocator import BufferAllocator
 from .buffers.base import BufferBase
 from .buffers.ep import EPBuffer, EPHandle
+from .buffers.decode import DecodeBuffer, DecodeHandle
 from .buffers.engram import EngramBuffer
 from .buffers.bucket import BucketBuffer, BucketSession
 from .buffers.pp import PPBuffer

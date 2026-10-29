@@ -25,6 +25,9 @@ class EPHandle:
     recomputation, and is consumed by `EPBuffer.combine` to reverse the token routing.
 
     Attributes:
+        is_low_latency: whether the handle belongs to the decode kernels. Low-latency
+            handles expose int64 device counts as ``expert_recv_counts`` and private
+            reverse-routing tables; throughput-only metadata fields remain None.
         do_expand: whether the expanding (one-token-per-expert-slot) layout is used.
         num_experts: the number of all experts.
         expert_alignment: align the number of tokens received by each local expert to this variable.
@@ -68,6 +71,7 @@ class EPHandle:
         assert topk_idx is not None
 
         self.do_expand = do_expand
+        self.is_low_latency = False
         self.num_experts = num_experts
         self.expert_alignment = expert_alignment
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
@@ -163,6 +167,11 @@ class EPHandle:
 class EPBuffer(BufferBase):
     """Expert-parallel dispatch/combine on Ascend, using the expanded layout.
 
+    The native runtime selects a small-batch MTE transport where supported,
+    using the same communication allocation, layouts, handles and epilogues.
+    Dispatch transports routing weights as metadata; combine never multiplies
+    them into the expert outputs. Apply model weights in the expert computation.
+
     Stream usage:
         All operations run on the current stream.
     """
@@ -188,13 +197,22 @@ class EPBuffer(BufferBase):
                  num_allocated_qps: int = 0,
                  num_cpu_timeout_secs: int = 300, num_gpu_timeout_secs: int = 100,
                  explicitly_destroy: bool = False,
-                 *, use_huge1g_page: bool = True):
+                 *, use_huge1g_page: bool = True, low_latency_mode: bool = False):
         """Create an EP buffer with the NV 2.5 argument order.
 
         Ascend uses a single HCCL domain. Hybrid and
         overlap preferences are compatibility options. LB storage can be allocated;
         LB kernels, RDMA service levels and explicit QP counts are unsupported. ``num_bytes`` excludes
         workspace and must be allocation-aligned.
+
+        The default path automatically selects its internal transport without
+        changing the public API or allocating a second communication buffer.
+
+        ``low_latency_mode=True`` selects the legacy experimental decode kernels (Ascend 950/A5,
+        EP8/16/32/64/128/256, 0 < B <= capacity <= 256). This mode reserves 8 GiB
+        per rank plus 2 MiB each for barrier workspace and rank-offset padding,
+        and has a restricted metadata/feature contract. Its combine also only
+        sums expert outputs; it no longer applies dispatch weights.
         """
         lb_allocation_plan = lb_allocation_plan_or_num_bytes if isinstance(lb_allocation_plan_or_num_bytes, BufferAllocator) else None
         num_lb_bytes = lb_allocation_plan_or_num_bytes if lb_allocation_plan is None else lb_allocation_plan.num_bytes
@@ -217,6 +235,17 @@ class EPBuffer(BufferBase):
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
         self.num_allocated_qps = 0
         self.num_lb_bytes = num_lb_bytes
+        self.low_latency_mode = low_latency_mode
+        if low_latency_mode:
+            if deterministic or num_lb_bytes or lb_allocation_plan is not None:
+                raise NotImplementedError('Low latency does not support deterministic sorting or LB storage')
+            if self.num_ranks not in (8, 16, 32, 64, 128, 256):
+                raise ValueError('Low latency requires EP8/16/32/64/128/256')
+            if not 0 < num_max_tokens_per_rank <= 256:
+                raise ValueError('Low latency requires 0 < num_max_tokens_per_rank <= 256')
+            if num_bytes not in (None, 8 << 30):
+                raise ValueError('Low latency requires exactly 8 GiB of communication storage')
+            num_bytes = 8 << 30
         if num_bytes is None:
             num_bytes = self.get_buffer_size_hint(
                 group, num_max_tokens_per_rank, hidden, num_topk, use_fp8_dispatch,
@@ -228,10 +257,17 @@ class EPBuffer(BufferBase):
 
         self.hccl_comm_handle = comm.get_hccl_comm_handle(group)
         super().__init__(explicitly_destroy)
-        self.runtime = _C.EPBuffer(
-            self.rank_idx, self.num_ranks, self.hccl_comm_handle.get(),
-            num_bytes, num_lb_bytes, use_huge1g_page, num_cpu_timeout_secs, num_gpu_timeout_secs,
-            explicitly_destroy)
+        if low_latency_mode:
+            from .low_latency import LowLatencyState
+            self._low_latency = LowLatencyState()
+            self.runtime = _C.LowLatencyBuffer(
+                self.rank_idx, self.num_ranks, self.hccl_comm_handle.get(),
+                use_huge1g_page, num_cpu_timeout_secs, num_gpu_timeout_secs, explicitly_destroy)
+        else:
+            self.runtime = _C.EPBuffer(
+                self.rank_idx, self.num_ranks, self.hccl_comm_handle.get(),
+                num_bytes, num_lb_bytes, use_huge1g_page, num_cpu_timeout_secs, num_gpu_timeout_secs,
+                explicitly_destroy)
         self.context = self.runtime.context
         if lb_allocation_plan is not None:
             lb_allocation_plan.materialize(self.runtime.lb_storage)
@@ -247,13 +283,18 @@ class EPBuffer(BufferBase):
         super().destroy()
         self.context = None
         self.hccl_comm_handle = None
+        if self.low_latency_mode:
+            self._low_latency.tilings.clear()
+            self._low_latency.last_event = None
+            self._low_latency.inflight = None
 
     @staticmethod
     def get_buffer_size_hint(group: dist.ProcessGroup,
                              num_max_tokens_per_rank: int, hidden: int,
                              num_topk: int = 0, use_fp8_dispatch: bool = False,
                              allow_hybrid_mode: bool = True,
-                             allow_multiple_reduction: bool = True) -> int:
+                             allow_multiple_reduction: bool = True,
+                             *, low_latency_mode: bool = False) -> int:
         """
         Get a recommended buffer size (in bytes) for the given MoE settings, without constructing
         the buffer. The returned value is aligned to 2 MB.
@@ -266,11 +307,16 @@ class EPBuffer(BufferBase):
             use_fp8_dispatch: whether to use FP8 for dispatch.
             allow_hybrid_mode: accepted for API compatibility; ignored on Ascend.
             allow_multiple_reduction: must be True on Ascend.
+            low_latency_mode: return the fixed 8 GiB decode communication size.
 
         Returns:
             size: the recommended buffer size in bytes (2 MB-aligned).
         """
         assert allow_multiple_reduction
+        if low_latency_mode:
+            if group.size() not in (8, 16, 32, 64, 128, 256) or not 0 < num_max_tokens_per_rank <= 256:
+                raise ValueError('Low latency requires EP8/16/32/64/128/256 and token capacity in [1,256]')
+            return 8 << 30
         return _C.calculate_ep_buffer_size(
             group.size(), num_max_tokens_per_rank, hidden, num_topk, use_fp8_dispatch)
 
@@ -345,6 +391,7 @@ class EPBuffer(BufferBase):
                 `[num_tokens, num_sf_packs]`.
             topk_idx: `[num_tokens, num_topk]` with `torch.int64`, the expert indices selected by each
                 token, `-1` means no selections. Must be `None` if `handle` is provided.
+                Low-latency mode requires valid, distinct expert IDs per token (no `-1`).
                 Stored by reference in the handle; must not be modified until all uses of the handle complete.
             topk_weights: `[num_tokens, num_topk]` with `torch.float`, the expert weights of each token
                 to dispatch. Can be provided with a cached `handle` to dispatch updated weights.
@@ -386,6 +433,15 @@ class EPBuffer(BufferBase):
                 of the five-item tuple. Call `event.current_stream_wait()` to run the copy epilogue and obtain
                 `(recv_x, recv_topk_idx, recv_topk_weights, handle)`.
         """
+        if self.low_latency_mode:
+            return self._low_latency.dispatch(
+                self, x, topk_idx, topk_weights, cumulative_local_expert_recv_stats,
+                num_experts, num_max_tokens_per_rank, expert_alignment, num_sms, num_qps,
+                previous_event, async_with_compute_stream, allocate_on_comm_stream, handle,
+                do_handle_copy, do_cpu_sync, do_expand, do_zero_padding,
+                use_tma_aligned_col_major_sf, defer_epilogue)
+        if getattr(handle, 'is_low_latency', False):
+            raise ValueError('A low-latency handle cannot be used with a throughput buffer')
         if num_qps not in (None, 0):
             raise NotImplementedError('Explicit QP counts are not implemented on Ascend')
 
@@ -538,7 +594,8 @@ class EPBuffer(BufferBase):
                 original ranks.
             handle: a must-set communication handle, you can obtain this from the `dispatch` function.
             topk_weights: `[num_tokens]` with `torch.float`. The expanded tokens' top-k weights for
-                reducing to their original ranks.
+                restoring to their original ranks as a separate output. These values do not
+                multiply `x`; any model weighting must already be present in the expert outputs.
             bias: `None`, a tensor, or a tuple of 2 `[num_combined_tokens, hidden]` tensors with
                 `torch.bfloat16` final bias to the output.
             num_sms: compatibility parameter; combine always uses `handle.num_sms`.
@@ -562,6 +619,12 @@ class EPBuffer(BufferBase):
         if num_qps not in (None, 0):
             raise NotImplementedError('Explicit QP counts are not implemented on Ascend')
 
+        if self.low_latency_mode:
+            return self._low_latency.combine(
+                self, x, handle, topk_weights, bias, num_sms, num_qps, previous_event,
+                async_with_compute_stream, allocate_on_comm_stream, defer_epilogue)
+        if getattr(handle, 'is_low_latency', False):
+            raise ValueError('A low-latency handle cannot be used with a throughput buffer')
         assert handle.recv_src_metadata is not None
         num_sms = handle.num_sms
         bias_0, bias_1 = EPBuffer._unpack_bias(bias)
