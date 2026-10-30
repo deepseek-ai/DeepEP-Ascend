@@ -1,5 +1,6 @@
 #!/bin/bash
-# Development build: compile the C++ extension and symlink .so into the package
+# Build a wheel in dist; this does not install or create an in-place extension.
+set -euo pipefail
 
 # Change current directory into project root
 original_dir=$(pwd)

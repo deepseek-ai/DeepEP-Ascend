@@ -49,8 +49,9 @@ static std::tuple<int, int> get_physical_domain_size(const std::string& hccl_gro
     uint32_t* layers = nullptr;
     uint32_t num_layers = 0;
     HCCL_CHECK(HcclRankGraphGetLayers(comm, &layers, &num_layers));
-    EP_HOST_ASSERT(num_layers > 1);
-    const auto layer = layers[1];
+    EP_HOST_ASSERT(layers != nullptr and num_layers > 0);
+    // Copy the selected layer before subsequent HCCL calls invalidate the list.
+    const auto layer = layers[num_layers > 1 ? 1 : 0];
     for (int peer_rank_idx = 0; peer_rank_idx < num_ranks; ++ peer_rank_idx) {
         if (peer_rank_idx == rank_idx)
             continue;

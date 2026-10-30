@@ -83,13 +83,13 @@ struct HCCLContext {
 
         if (num_ranks > 1) {
             EP_HOST_ASSERT(num_ranks % 2 == 0);
-            // Use net layer 1 for UBMEM channels and Jetties
+            // Prefer the second network layer, or the only layer on single-layer fabrics.
             uint32_t* layers = nullptr;
             uint32_t num_layers = 0;
             HCCL_CHECK(HcclRankGraphGetLayers(comm, &layers, &num_layers));
-            EP_HOST_ASSERT(num_layers > 1);
+            EP_HOST_ASSERT(layers != nullptr and num_layers > 0);
             // HCCL owns `layers` and subsequent calls may invalidate it, so copy the layer value immediately.
-            const auto layer = layers[1];
+            const auto layer = layers[num_layers > 1 ? 1 : 0];
 
             // Acquire UBMEM channels and Jetties
             acquire_ubmem_channels(layer);

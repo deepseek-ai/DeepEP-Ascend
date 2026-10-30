@@ -13,6 +13,8 @@ from torch.utils.cpp_extension import BuildExtension
 from torch.utils.cpp_extension import include_paths as torch_include_paths
 from torch.utils.cpp_extension import library_paths as torch_library_paths
 
+from build_support import get_ascend_build_paths, prepare_deep_jit_headers
+
 current_dir = os.path.dirname(os.path.realpath(__file__))
 persistent_env_names = (
     'EP_JIT_CACHE_DIR',
@@ -62,6 +64,18 @@ def get_ascend_home():
     return ascend_home
 
 
+class CustomBuildExtension(BuildExtension):
+    def build_extensions(self):
+        include_dir = prepare_deep_jit_headers(
+            Path(current_dir) / 'third-party/deep_jit/include',
+            Path(self.build_temp) / 'deep_jit_compat/include')
+        for extension in self.extensions:
+            extension.include_dirs = [include_dir] + [
+                path for path in (extension.include_dirs or []) if path != include_dir]
+        print(f' > DeepJIT host compatibility headers: {include_dir}')
+        super().build_extensions()
+
+
 class CustomBuildPy(build_py):
     def run(self):
         # Make clusters' cache setting default into `envs.py`
@@ -85,7 +99,7 @@ class CustomBuildPy(build_py):
         code = '# Pre-installed environment variables\n'
         code += 'persistent_envs = dict()\n'
         for name in persistent_env_names:
-            code += f"persistent_envs['{name}'] = '{os.environ[name]}'\n" if name in os.environ else ''
+            code += f'persistent_envs[{name!r}] = {os.environ[name]!r}\n' if name in os.environ else ''
 
         # Create temporary build directory
         build_include_dir = os.path.join(self.build_lib, 'deep_ep')
@@ -96,6 +110,7 @@ class CustomBuildPy(build_py):
 
 if __name__ == '__main__':
     ascend_home = get_ascend_home()
+    ascend_include_dirs, ascend_library_dir = get_ascend_build_paths(ascend_home)
     torch_npu_dir = os.path.dirname(torch_npu.__file__)
     package_dir = Path(current_dir) / 'deep_ep'
 
@@ -114,22 +129,19 @@ if __name__ == '__main__':
         f'{current_dir}/csrc',
         f'{current_dir}/deep_ep/include',
         f'{current_dir}/third-party/deep_jit/include',
-        f'{ascend_home}/aarch64-linux/include',
-        # TODO(HUAWEI): cleanup include paths
-        f'{ascend_home}/aarch64-linux/asc',
-        f'{ascend_home}/aarch64-linux/asc/include',
+        *ascend_include_dirs,
         f'{torch_npu_dir}/include',
         f'{torch_npu_dir}/include/third_party/acl/inc',
     ] + torch_include_paths()
 
     library_dirs = [
-        f'{ascend_home}/lib64',
+        ascend_library_dir,
         f'{torch_npu_dir}/lib',
     ] + torch_library_paths()
 
     libraries = ['ascendcl', 'hccl', 'hcomm', 'torch_npu']
     extra_link_args = [
-        f'-Wl,-rpath,{ascend_home}/lib64',
+        f'-Wl,-rpath,{ascend_library_dir}',
         '-Wl,-Bsymbolic-functions',
         '-Wl,--enable-new-dtags',
     ]
@@ -169,9 +181,11 @@ if __name__ == '__main__':
     setuptools.setup(
         name='deep_ep',
         version=get_package_version(),
+        license_files=['third-party/cann.LICENSE', 'third-party/ascend-deepep.LICENSE'],
         packages=setuptools.find_packages(include=['deep_ep', 'deep_ep.*']),
         # Older setuptools versions do not expand recursive package-data globs.
-        package_data={'deep_ep': [str(path.relative_to(package_dir)) for path in (package_dir / 'include').rglob('*.hpp')]},
+        package_data={'deep_ep': [str(path.relative_to(package_dir)) for path in (package_dir / 'include').rglob('*')
+                                 if path.suffix in ('.hpp', '.h')]},
         ext_modules=[ext_module],
-        cmdclass={'build_ext': BuildExtension, 'build_py': CustomBuildPy},
+        cmdclass={'build_ext': CustomBuildExtension, 'build_py': CustomBuildPy},
     )
