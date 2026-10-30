@@ -223,7 +223,7 @@ class EPBuffer(BufferBase):
                 allow_hybrid_mode, allow_multiple_reduction)
         assert num_bytes >= 0 and num_bytes % _C.get_num_allocation_alignment() == 0
         self.num_bytes = num_bytes
-        if os.environ.get('EP_BUFFER_DEBUG', 0):
+        if int(os.environ.get('EP_BUFFER_DEBUG', 0) or 0):
             print(f'Initializing EP buffer with {num_bytes} bytes at rank EP {self.rank_idx}/{self.num_ranks}')
 
         self.hccl_comm_handle = comm.get_hccl_comm_handle(group)
