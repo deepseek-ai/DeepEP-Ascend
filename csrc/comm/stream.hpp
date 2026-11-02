@@ -1,12 +1,21 @@
 #pragma once
 
+#include <map>
+#include <mutex>
+
 #include "../utils/event.hpp"
 
 namespace deep_ep::comm {
 
 static c10_npu::NPUStream get_comm_stream() {
-    static const auto comm_stream = c10_npu::getStreamFromPool(true, -1);
-    return comm_stream;
+    static std::mutex mutex;
+    static std::map<c10::DeviceIndex, c10_npu::NPUStream> streams;
+    const auto device = c10_npu::getCurrentNPUStream().device_index();
+    const std::lock_guard lock(mutex);
+    auto stream = streams.find(device);
+    if (stream == streams.end())
+        stream = streams.emplace(device, c10_npu::getStreamFromPool(true, device)).first;
+    return stream->second;
 }
 
 static c10_npu::NPUEvent create_event(const c10_npu::NPUStream& stream) {
