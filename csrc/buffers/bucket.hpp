@@ -44,7 +44,7 @@ public:
             contexts.back()->set_common_signals(&workspace.signals[context_idx].common_signals);
         }
         main_context = contexts.front();
-        storage = torch::from_blob(main_context->buffer, {num_storage_bytes}, [context = main_context](void*) {},
+        storage = at_npu::native::from_blob(main_context->buffer, {num_storage_bytes}, [context = main_context](void*) {},
                                    torch::TensorOptions().dtype(torch::kByte).device(TORCH_DEVICE_NPU));
     }
 

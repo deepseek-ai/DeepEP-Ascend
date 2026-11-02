@@ -47,7 +47,7 @@ public:
         main_context = context;
         auto& workspace = *static_cast<layout::EPSignals*>(context->workspace);
         context->set_common_signals(&workspace.common_signals);
-        lb_storage = torch::from_blob(
+        lb_storage = at_npu::native::from_blob(
             context->buffer, {num_buffer_bytes + num_lb_buffer_bytes}, [context = context](void*) {},
             torch::TensorOptions().dtype(torch::kByte).device(TORCH_DEVICE_NPU)
         ).narrow(0, num_buffer_bytes, num_lb_buffer_bytes);

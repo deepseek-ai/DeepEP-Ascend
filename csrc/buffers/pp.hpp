@@ -38,7 +38,7 @@ public:
         main_context = context;
         auto& pp = *static_cast<layout::PPSignals*>(context->workspace);
         context->set_common_signals(&pp.common_signals);
-        storage = torch::from_blob(context->buffer, {num_storage_bytes}, [context = context](void*) {},
+        storage = at_npu::native::from_blob(context->buffer, {num_storage_bytes}, [context = context](void*) {},
                                    torch::TensorOptions().dtype(torch::kByte).device(TORCH_DEVICE_NPU));
     }
 

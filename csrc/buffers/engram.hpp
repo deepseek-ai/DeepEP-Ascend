@@ -156,7 +156,7 @@ public:
                                      num_entries_per_token * engram_hidden * engram_elem_size;
         std::vector<torch::Tensor> fetched;
         for (int layer_idx = 0; layer_idx < num_layers; ++ layer_idx)
-            fetched.push_back(torch::from_blob(
+            fetched.push_back(at_npu::native::from_blob(
                 math::advance_ptr<void>(context->buffer, layer_idx * num_layer_bytes),
                 {num_tokens, num_entries_per_token * engram_hidden},
                 [context = context](void*) {},
