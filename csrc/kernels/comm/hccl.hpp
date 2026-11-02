@@ -92,7 +92,7 @@ struct HCCLContext {
             const auto layer = layers[1];
 
             // Acquire UBMEM channels and Jetties
-            acquire_ubmem_channels(layer);
+            acquire_ubmem_channels(layer, buffer_uid);
             acquire_jetties(layer, num_jetties, buffer_uid, num_cpu_timeout_secs);
         }
     }
@@ -170,7 +170,7 @@ private:
 
     // One UBMEM channel per non-self peer on `layer`; resolves peer_ptrs to each
     // remote's registered workspace address.
-    void acquire_ubmem_channels(uint32_t layer) {
+    void acquire_ubmem_channels(uint32_t layer, const std::string& buffer_uid) {
         auto descs = build_peer_descs(layer,
             [](auto proto) { return proto == COMM_PROTOCOL_UB_MEM; },
             "no UB_MEM link to peer on the chosen layer");
@@ -180,16 +180,23 @@ private:
                                       descs.data(), static_cast<uint32_t>(descs.size()),
                                       channels.data()));
 
-        // The last remote mem is the registered userbuffer.
+        // The remote list also contains HCCL's own buffers; locate our registration by tag.
         for (size_t i = 0; i < descs.size(); ++ i) {
             const auto peer_rank_idx = static_cast<int>(descs[i].remoteRank);
             uint32_t num_mems = 0;
             CommMem* remote_mems = nullptr;
             char** mem_tags = nullptr;
             HCCL_CHECK(HcclChannelGetRemoteMems(comm, channels[i], &num_mems, &remote_mems, &mem_tags));
-            EP_HOST_ASSERT(num_mems >= 1);
-            EP_HOST_ASSERT(remote_mems[num_mems - 1].size == this->num_bytes);
-            peer_ptrs[peer_rank_idx] = reinterpret_cast<int64_t>(remote_mems[num_mems - 1].addr);
+            const CommMem* remote_mem = nullptr;
+            for (uint32_t j = 0; j < num_mems; ++ j) {
+                if (buffer_uid == mem_tags[j]) {
+                    remote_mem = &remote_mems[j];
+                    break;
+                }
+            }
+            EP_HOST_ASSERT(remote_mem != nullptr and "registered workspace is missing on peer");
+            EP_HOST_ASSERT(remote_mem->size == this->num_bytes);
+            peer_ptrs[peer_rank_idx] = reinterpret_cast<int64_t>(remote_mem->addr);
         }
     }
 
