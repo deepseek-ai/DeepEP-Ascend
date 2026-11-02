@@ -71,14 +71,15 @@ public:
         }
 
         const auto num_storage_bytes = num_total_entries * hidden * elem_size;
-        num_engram_recv_bytes = static_cast<int64_t>(num_entries_per_layer.size()) *
-                                num_max_tokens * num_entries_per_token * hidden * elem_size;
+        const auto num_recv_bytes = static_cast<int64_t>(num_entries_per_layer.size()) *
+                                    num_max_tokens * num_entries_per_token * hidden * elem_size;
         const auto num_sf_bytes = static_cast<int64_t>(num_total_entries) *
                                   num_sf_packs * sizeof(sf_pack_t);
-        EP_HOST_ASSERT(num_engram_recv_bytes + num_sf_bytes <= context->num_gpu_buffer_bytes);
+        EP_HOST_ASSERT(num_recv_bytes + num_sf_bytes <= context->num_gpu_buffer_bytes);
         EP_HOST_ASSERT(num_storage_bytes <= context->num_rdma_storage_bytes);
 
         num_engram_entries_per_layer = num_entries_per_layer;
+        num_engram_recv_bytes = num_recv_bytes;
         engram_hidden = hidden;
         engram_elem_size = elem_size;
         num_max_engram_tokens = num_max_tokens;
