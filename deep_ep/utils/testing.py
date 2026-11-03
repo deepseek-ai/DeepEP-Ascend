@@ -57,7 +57,9 @@ def parse_num_bytes(text: str) -> int:
         raise ValueError('Expected a byte count such as 1G, 64M, 512K, or 1048576')
     scale = {None: 1, 'k': 1 << 10, 'm': 1 << 20, 'g': 1 << 30, 't': 1 << 40}
     suffix = match.group(2)
-    value = int(float(match.group(1)) * scale[suffix.lower() if suffix else None])
+    whole, _, fraction = match.group(1).partition('.')
+    numerator = int(whole + fraction) * scale[suffix.lower() if suffix else None]
+    value = numerator // 10 ** len(fraction)
     if value <= 0:
         raise ValueError('Byte count must be positive')
     return value
