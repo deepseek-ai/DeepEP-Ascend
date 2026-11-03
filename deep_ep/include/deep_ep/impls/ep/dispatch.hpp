@@ -3,9 +3,7 @@
 #include <climits>
 
 #include <kernel_operator.h>
-#include <simt_api/device_atomic_functions.h>
-#include <simt_api/device_sync_functions.h>
-#include <simt_api/device_warp_functions.h>
+#include <simt_api/asc_simt.h>
 #include <c_api/sync/sync.h>
 #include <c_api/vector_datamove/vector_datamove.h>
 
@@ -668,10 +666,10 @@ __global__ __vector__ void dispatch_impl(
 
         // Call VF
         // TODO(HUAWEI): launching this VF costs 0.5 us, which is slow
-        AscendC::Simt::VF_CALL<
+        asc_vf_call<
             simt_persistent_worker<kNumMaxTokensPerRank, kNumRanks, kNumExperts, kNumTopk, kExpertAlignment, kCachedMode, kDoCPUSync,
                                    kNumVecCores, kNumThreads, kNumSGEPairsPerSQE, kNumTimeoutCycles>>(
-            AscendC::Simt::Dim3(kNumThreads, 1, 1),
+            dim3(kNumThreads, 1, 1),
             workspace_layout, host_workspace_layout, ub_layout,
             static_cast<__gm__ const uint8_t*>(x), metadata_send_buffer,
             static_cast<__gm__ const uint64_t*>(jetty_ptrs),

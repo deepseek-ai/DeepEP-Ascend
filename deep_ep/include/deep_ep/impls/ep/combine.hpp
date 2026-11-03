@@ -10,10 +10,9 @@
 #include <deep_ep/common/math.hpp>
 
 #include <kernel_operator.h>
+#include <simt_api/asc_simt.h>
 #include <c_api/sync/sync.h>
 #include <c_api/vector_datamove/vector_datamove.h>
-#include <simt_api/device_functions.h>
-#include <simt_api/device_warp_functions.h>
 
 namespace deep_ep {
 
@@ -205,8 +204,8 @@ __global__ __vector__ void combine_impl(__gm__ bfloat16_t* x, __gm__ float* topk
 
     handle::HcommJetty jetty(&ub->jetty_info, nullptr, jetty_ptrs, vec_core_idx);
     if constexpr (kNumRanks > 1) {
-        AscendC::Simt::VF_CALL<load_combine_peers<kNumRanks>>(
-            AscendC::Simt::Dim3(math::align(kNumRanks, warpSize), 1, 1), ub->peer_infos, jetty_ptrs, rank_idx);
+        asc_vf_call<load_combine_peers<kNumRanks>>(
+            dim3(math::align(kNumRanks, warpSize), 1, 1), ub->peer_infos, jetty_ptrs, rank_idx);
         asc_sync_notify(PIPE_V, PIPE_S, EVENT_ID0);
         asc_sync_wait(PIPE_V, PIPE_S, EVENT_ID0);
     }
@@ -270,9 +269,9 @@ __global__ __vector__ void combine_impl(__gm__ bfloat16_t* x, __gm__ float* topk
         const auto issue_wqe = task.rank_idx != rank_idx;
         fetched_tasks[stage_idx] = task;
         const auto task_sqebb_idx = next_remote_sqebb_idx;
-        AscendC::Simt::VF_CALL<load_meta_issue_wqe<kNumRanks, kNumTopk, kNumMaxTokensPerRank,
+        asc_vf_call<load_meta_issue_wqe<kNumRanks, kNumTopk, kNumMaxTokensPerRank,
                                                  kNumVecCores, kNumTokensPerTask, UBLayout, kHasTopkWeights>>(
-            AscendC::Simt::Dim3(kNumTokensPerTask * warpSize, 1, 1),
+            dim3(kNumTokensPerTask * warpSize, 1, 1),
             ub, src_metadata, x, send_buffer, combine_recv_buffer, topk_weight_u32,
             combine_recv_buffer_offset, task, task_sqebb_idx, stage_idx, rank_idx, issue_wqe
         );

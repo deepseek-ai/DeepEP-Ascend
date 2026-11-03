@@ -9,9 +9,7 @@
 #include <deep_ep/comm/handle.hpp>
 
 #include <kernel_operator.h>
-#include <simt_api/device_functions.h>
-#include <simt_api/device_atomic_functions.h>
-#include <simt_api/device_sync_functions.h>
+#include <simt_api/asc_simt.h>
 #include <c_api/sync/sync.h>
 #include <c_api/asc_simd.h>
 #include <utils/debug/asc_time.h>
@@ -53,7 +51,7 @@ template <int kNumRanks>
 __simt_vf__ __aicore__ __launch_bounds__(kNumMaxRanks) void remote_signal(
     __gm__ layout::CommonSignals* signals, const int phase, const int delta) {
     EP_STATIC_ASSERT(kNumRanks <= kNumMaxRanks);
-    if (const auto thread_idx = static_cast<int>(AscendC::Simt::GetThreadIdx()); thread_idx < kNumRanks) {
+    if (const auto thread_idx = static_cast<int>(threadIdx.x); thread_idx < kNumRanks) {
         const auto remote_signal = layout::get_sym_ptr(*signals, &signals->barrier_signals[phase], thread_idx);
         asc_atomic_add(remote_signal, delta);
     }
@@ -155,8 +153,8 @@ __aicore__ __forceinline__ void barrier(
 
         // Remote atomic add: parallel SIMT write to each peer's signal[phase] via UBMEM.
         __gm__ int* signal_ptr = &signals.barrier_signals[phase];
-        AscendC::Simt::VF_CALL<simt::remote_signal<kNumRanks>>(
-            AscendC::Simt::Dim3(kNumRanks, 1, 1),
+        asc_vf_call<simt::remote_signal<kNumRanks>>(
+            dim3(kNumRanks, 1, 1),
             &signals, phase, delta
         );
 
