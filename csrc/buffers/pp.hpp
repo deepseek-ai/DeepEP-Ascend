@@ -31,7 +31,7 @@ public:
         EP_HOST_ASSERT(num_max_tensor_bytes > 0 and num_max_inflight_tensors > 0);
         EP_HOST_ASSERT(num_max_pp_tensor_bytes <= std::numeric_limits<uint32_t>::max());
         const auto num_storage_bytes = math::align<int64_t>(
-            4 * num_max_pp_tensor_bytes * num_max_inflight_tensors, kNumAllocationAlignmentBytes);
+            2 * num_max_pp_tensor_bytes * num_max_inflight_tensors, kNumAllocationAlignmentBytes);
         context = std::make_shared<comm::Context>(
             hccl_group_name, rank_idx, num_ranks, sizeof(layout::PPSignals), num_storage_bytes, 0,
             use_huge1g_page, 300, num_gpu_timeout_secs);
