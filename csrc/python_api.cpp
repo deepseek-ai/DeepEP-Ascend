@@ -10,6 +10,7 @@
 #include "comm/api.hpp"
 #include "runtime/jit.hpp"
 #include "utils/event.hpp"
+#include "utils/l2_cache.hpp"
 
 #ifndef TORCH_EXTENSION_NAME
 #define TORCH_EXTENSION_NAME _C
@@ -21,6 +22,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.doc() = "DeepEP communication buffers (Ascend)";
     config::register_apis(m);
+    l2_cache::register_apis(m);
     m.attr("topk_idx_t") = py::cast(torch::kInt64);
 
     py::class_<EventHandle>(m, "EventHandle")

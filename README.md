@@ -229,6 +229,25 @@ All ranks must supply equally sized shards, and the bucket must have enough spac
 
 Set environment variables consistently on every rank, before importing the package or constructing buffers.
 
+The `bench_msprof` helper keeps its historical `flush_l2=True` behavior for
+compatibility: an oversized `zero_()` sweep evicts the preceding working set
+but leaves the flush buffer's resident cache lines Dirty. Benchmarks that need a
+Clean L2 precondition should request the two-stage path explicitly:
+
+```python
+profile = bench_msprof(
+    fn,
+    flush_l2=True,
+    flush_l2_clean=True,
+)
+```
+
+The second stage revisits the same buffer with an AscendC
+`NOTALLOC_CLEAN` store kernel. Misses bypass L2, while resident lines are
+retained and marked Clean. Setting `flush_l2_clean=True` while disabling
+`flush_l2` is invalid because the normal write sweep is what evicts the old
+working set.
+
 | Variable | Use |
 | --- | --- |
 | `EP_AVOID_RECORD_STREAM` | Required for Bucket all-gather; EP retains URMA sources through epilogue captures independently of this flag |

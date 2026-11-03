@@ -294,6 +294,21 @@ def _device_busy() -> None:
     a @ a
 
 
+def _flush_l2_to_clean(buffer: torch.Tensor) -> None:
+    """Evict the old L2 working set and leave the flush lines Clean.
+
+    zero_ provides the eviction sweep, but normal write allocation leaves the
+    resident tail of that oversized buffer Dirty. The second sweep uses an
+    AscendC NOTALLOC_CLEAN store over the same addresses: misses bypass L2,
+    while hits retain the line and change its state to Clean.
+    """
+    buffer.zero_()
+
+    # Import lazily to avoid a deep_ep package initialization cycle.
+    from deep_ep import _C
+    _C.zero_l2_cache_clean(buffer)
+
+
 def bench_msprof(
     fn: Callable,
     kernel_names: Union[str, list[str], None] = None,
@@ -303,7 +318,8 @@ def bench_msprof(
     return_all_kernels: bool = False,
     flush_l2: bool = True,
     barrier_comm_profiling: bool = False,
-    barrier: Optional[Callable] = None
+    barrier: Optional[Callable] = None,
+    flush_l2_clean: bool = False,
 ) -> Union[KernelProfile, list[KernelProfile], dict[str, KernelProfile]]:
     """Profile kernel(s) using torch_npu.profiler with pipe utilization.
 
@@ -319,15 +335,24 @@ def bench_msprof(
         num_tests: measurement iterations inside profiler active phase.
         suppress_verbose_output: suppress torch_npu.profiler stdout/stderr spam.
         return_all_kernels: if True, return dict[str, KernelProfile] (ignores kernel_names).
-        flush_l2: flush L2 cache between iterations.
+        flush_l2: evict the previous L2 working set between iterations by
+            writing an oversized buffer. For backward compatibility, this
+            legacy path leaves the flush buffer's resident lines Dirty unless
+            flush_l2_clean is enabled.
         barrier_comm_profiling: insert a device-busy op and a cross-rank barrier before each
             iteration to reduce unbalanced CPU launch overhead. Disabled by the
             `EP_DISABLE_BARRIER_PROFILING` env var.
         barrier: a custom barrier callable to use instead of `dist.all_reduce`.
+        flush_l2_clean: after the normal eviction sweep, revisit the same
+            buffer with NOTALLOC_CLEAN stores so the lines left resident in L2
+            are Clean. Requires flush_l2=True.
 
     Returns:
         KernelProfile, list[KernelProfile], or dict[str, KernelProfile].
     """
+    if flush_l2_clean and not flush_l2:
+        raise ValueError('flush_l2_clean requires flush_l2=True')
+
     for _ in range(num_warmups):
         fn()
     torch.npu.synchronize()
@@ -336,6 +361,10 @@ def bench_msprof(
         barrier()
 
     flush_l2_size = int(8e9 // 4)
+    clean_flush_buffer = (
+        torch.empty(flush_l2_size, dtype=torch.int, device='npu')
+        if flush_l2_clean else None
+    )
     barrier_comm_profiling &= int(os.environ.get('EP_DISABLE_BARRIER_PROFILING', 0)) == 0
     dummy = torch.ones(1, dtype=torch.float, device='npu') if barrier_comm_profiling and barrier is None else None
 
@@ -358,7 +387,16 @@ def bench_msprof(
             ) as prof:
                 for _ in range(num_tests):
                     if flush_l2:
-                        torch.empty(flush_l2_size, dtype=torch.int, device='npu').zero_()
+                        if flush_l2_clean:
+                            # Keep this tensor alive for the complete profile.
+                            # The mode-4 pass must revisit the exact addresses
+                            # dirtied by zero_(), not a different allocation.
+                            assert clean_flush_buffer is not None
+                            _flush_l2_to_clean(clean_flush_buffer)
+                        else:
+                            # Historical behavior: this evicts the prior
+                            # working set but leaves resident flush lines Dirty.
+                            torch.empty(flush_l2_size, dtype=torch.int, device='npu').zero_()
                     if barrier_comm_profiling:
                         _device_busy()
                         if barrier is None:
