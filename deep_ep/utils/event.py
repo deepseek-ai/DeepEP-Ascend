@@ -46,8 +46,10 @@ class EventOverlap:
         # Call epilogue hook
         result = None
         if self.hook_after_wait is not None:
-            result = self.hook_after_wait()
+            # Consume the hook before calling it, including on reentry or failure.
+            hook_after_wait = self.hook_after_wait
             self.hook_after_wait = None
+            result = hook_after_wait()
 
         # Release event handle
         if release_handle:
