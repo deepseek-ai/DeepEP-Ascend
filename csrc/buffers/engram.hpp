@@ -104,11 +104,12 @@ public:
             EP_HOST_ASSERT(storage.dim() == 2 and storage.size(0) == num_engram_entries_per_layer[layer_idx] and
                            storage.size(1) == engram_hidden and storage.element_size() == engram_elem_size);
             EP_HOST_ASSERT(storage.scalar_type() == (num_engram_sf_packs > 0 ? torch::kFloat8_e4m3fn : torch::kBFloat16));
-            EP_HOST_ASSERT(storage.device().type() == TORCH_DEVICE_NPU and storage.is_contiguous());
+            EP_HOST_ASSERT((storage.device().type() == TORCH_DEVICE_NPU or storage.is_cpu()) and storage.is_contiguous());
 
             ACL_CHECK(aclrtMemcpy(
                 storage_ptr, storage.nbytes(),
-                storage.data_ptr(), storage.nbytes(), ACL_MEMCPY_DEVICE_TO_DEVICE
+                storage.data_ptr(), storage.nbytes(),
+                storage.is_cpu() ? ACL_MEMCPY_HOST_TO_DEVICE : ACL_MEMCPY_DEVICE_TO_DEVICE
             ));
             storage_ptr = math::advance_ptr<void>(storage_ptr, storage.nbytes());
         }

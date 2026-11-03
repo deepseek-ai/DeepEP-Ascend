@@ -134,7 +134,10 @@ class EngramBuffer(BufferBase):
 
     def write(self, storages: List[torch.Tensor],
               sfs: Optional[List[torch.Tensor]] = None) -> None:
-        """Copy local storage and each rank's shard of the replicated SF tables."""
+        """Copy CPU/NPU local storage into NPU tables, plus each rank's NPU SF shard.
+
+        CPU inputs are checkpoint staging only; runtime storage remains NPU-backed.
+        """
         self.runtime.write(storages, sfs)
 
     def fetch(self, indices: torch.Tensor, num_qps: int = 0,
