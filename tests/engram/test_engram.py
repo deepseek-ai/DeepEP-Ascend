@@ -45,6 +45,19 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         num_entries_per_layer, args.hidden,
         args.num_tokens, args.num_entries_per_token, dtype, num_sf_packs)
 
+    if args.use_fp8:
+        # Reject a larger receive layout, then exercise the previous configuration
+        # in the existing write/fetch checks below. Its SF offset must remain valid.
+        num_recv_token_bytes = num_layers * args.num_entries_per_token * args.hidden * dtype.itemsize
+        try:
+            buffer.set_config(
+                num_entries_per_layer, args.hidden,
+                num_bytes // num_recv_token_bytes + 1, args.num_entries_per_token, dtype, num_sf_packs)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError('An oversized Engram receive configuration was accepted')
+
     # Write buffer
     local_storages, sfs = [], [] if args.use_fp8 else None
     for num_entries in num_entries_per_layer:
