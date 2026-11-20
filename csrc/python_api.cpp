@@ -50,6 +50,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def(py::init<int, int, std::string, int64_t, int64_t, bool, int, bool>())
         .def_readonly("context", &EngramBuffer::context)
         .def("set_config", &EngramBuffer::set_config)
+        .def("get_storage_tensors", &EngramBuffer::get_storage_tensors)
         .def("write", &EngramBuffer::write)
         .def("fetch", &EngramBuffer::fetch);
 

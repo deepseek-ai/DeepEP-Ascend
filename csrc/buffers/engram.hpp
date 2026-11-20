@@ -6,6 +6,7 @@
 
 #include <pybind11/functional.h>
 #include <pybind11/stl.h>
+#include <torch_npu/csrc/aten/common/from_blob.h>
 
 #include <deep_ep/layout/engram/workspace.hpp>
 
@@ -86,6 +87,24 @@ public:
         num_engram_sf_packs = num_sf_packs;
     }
 
+    std::vector<torch::Tensor> get_storage_tensors() const {
+        EP_HOST_ASSERT(not destroyed and not num_engram_entries_per_layer.empty());
+        const auto dtype = num_engram_sf_packs > 0 ? torch::kFloat8_e4m3fn : torch::kBFloat16;
+        // Retain the allocation itself: Context::finalize() releases its owners.
+        const auto storage_owner = context->hccl_context->memory;
+        auto* storage_ptr = context->local_rdma_storage_ptr;
+        std::vector<torch::Tensor> storages;
+        storages.reserve(num_engram_entries_per_layer.size());
+        for (const auto& num_entries: num_engram_entries_per_layer) {
+            storages.push_back(at_npu::native::from_blob(
+                storage_ptr, {static_cast<int64_t>(num_entries), static_cast<int64_t>(engram_hidden)},
+                [storage_owner](void*) {},
+                torch::TensorOptions().dtype(dtype).device(TORCH_DEVICE_NPU)));
+            storage_ptr = math::advance_ptr<void>(storage_ptr, storages.back().nbytes());
+        }
+        return storages;
+    }
+
     void write(const std::vector<torch::Tensor>& storages,
                const std::optional<std::vector<torch::Tensor>>& sfs) {
         EP_HOST_ASSERT(not destroyed);
@@ -106,10 +125,13 @@ public:
             EP_HOST_ASSERT(storage.scalar_type() == (num_engram_sf_packs > 0 ? torch::kFloat8_e4m3fn : torch::kBFloat16));
             EP_HOST_ASSERT(storage.device().type() == TORCH_DEVICE_NPU and storage.is_contiguous());
 
-            ACL_CHECK(aclrtMemcpy(
-                storage_ptr, storage.nbytes(),
-                storage.data_ptr(), storage.nbytes(), ACL_MEMCPY_DEVICE_TO_DEVICE
-            ));
+            // A checkpoint loader may have already filled the final storage.
+            if (storage.data_ptr() != storage_ptr) {
+                ACL_CHECK(aclrtMemcpy(
+                    storage_ptr, storage.nbytes(),
+                    storage.data_ptr(), storage.nbytes(), ACL_MEMCPY_DEVICE_TO_DEVICE
+                ));
+            }
             storage_ptr = math::advance_ptr<void>(storage_ptr, storage.nbytes());
         }
         // Write the local SF shard
