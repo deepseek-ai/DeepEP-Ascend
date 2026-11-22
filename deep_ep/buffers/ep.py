@@ -377,7 +377,9 @@ class EPBuffer(BufferBase):
         Returns:
             recv_x: received tokens, the same type and tuple as the input `x`.
                 Only returned when `defer_epilogue=False`.
-            recv_topk_idx: received expert indices. Only returned when `defer_epilogue=False`.
+            recv_topk_idx: received expert indices. Always `None` on Ascend (the expand-only path
+                does not produce this tensor); kept in the return tuple for positional
+                compatibility with the NVIDIA DeepEP interface.
             recv_topk_weights: received expert weights (`None` if `topk_weights` was not provided).
                 Only returned when `defer_epilogue=False`.
             handle: the returned communication handle. Only returned when `defer_epilogue=False`.
