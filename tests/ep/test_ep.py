@@ -19,7 +19,7 @@ from deep_ep.utils.math import align, count_bytes, per_token_cast_to_fp8, safe_d
 from deep_ep.utils.refs import combine as ref_combine
 from deep_ep.utils.refs import dispatch as ref_dispatch
 from deep_ep.utils.refs import generate_pre_combine_data
-from deep_ep.utils.testing import bench_msprof
+from deep_ep.utils.testing import bench_msprof, flush_l2_cache
 
 
 def enumerate_dispatch_modes():
@@ -52,6 +52,7 @@ def test_dispatch_combine(buffer: deep_ep.EPBuffer, args: argparse.Namespace):
     num_max_tokens_per_rank = args.num_tokens
     num_tokens = max(1, args.num_tokens - dist.get_rank())
     hidden = args.hidden
+    combine_dtype = torch.float32 if args.use_fp32_output else torch.bfloat16
     num_topk = args.num_topk
     num_experts = args.num_experts
     num_local_experts = num_experts // num_ranks
@@ -61,13 +62,14 @@ def test_dispatch_combine(buffer: deep_ep.EPBuffer, args: argparse.Namespace):
                f' > Ranks: {num_ranks}\n'
                f' > Experts: {num_topk}/{num_experts}\n'
                f' > Tokens: {num_tokens} (max: {num_max_tokens_per_rank}), hidden: {hidden}\n'
+               f' > Combine output: {combine_dtype}\n'
                f' > #AI cores: {num_ai_cores}\n'
                f' > Modes: do_expand=1, allow_hybrid_mode=0, allow_multiple_reduction={args.allow_multiple_reduction}\n',
                once_in_node=True)
 
     scores = get_unbalanced_scores(
         num_tokens, num_experts, num_ranks, num_topk,
-        args.unbalanced_ratio, args.precise_unbalanced_ratio)
+        args.unbalanced_ratio, args.precise_unbalanced_ratio, args.synthetic_unbalanced_ratio)
     topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
     topk_idx = topk_idx.to(torch.int64)
     if args.masked_ratio > 0:
@@ -75,8 +77,10 @@ def test_dispatch_combine(buffer: deep_ep.EPBuffer, args: argparse.Namespace):
         topk_idx.masked_fill_(rand_mask < args.masked_ratio, -1)
         topk_weights.masked_fill_(topk_idx < 0, 0)
 
-    if not args.skip_perf_test:
-        l2_dirty_buffer = torch.empty(1 << 26, dtype=torch.int, device='npu')
+    # Permute top-k positions to avoid positional bias in scores
+    topk_perm = torch.rand_like(topk_weights).argsort(dim=-1)
+    topk_idx = topk_idx.gather(dim=-1, index=topk_perm)
+    topk_weights = topk_weights.gather(dim=-1, index=topk_perm)
 
     dist_print('Running expand dispatch/combine test cases:', once_in_node=True)
     for expert_alignment, num_bias, use_fp8_dispatch, use_col_major_sf in enumerate_dispatch_modes():
@@ -169,6 +173,7 @@ def test_dispatch_combine(buffer: deep_ep.EPBuffer, args: argparse.Namespace):
             bias=bias,
             num_sms=num_ai_cores,
             async_with_compute_stream=True,
+            use_fp32_output=args.use_fp32_output,
         )
         torch.npu.synchronize()
 
@@ -299,7 +304,8 @@ def test_dispatch_combine(buffer: deep_ep.EPBuffer, args: argparse.Namespace):
                 dist.get_rank() * num_max_tokens_per_rank + torch.arange(num_tokens, device='npu'),
                 num_max_tokens_per_rank, num_topk, hidden)
             ref_y[topk_idx == -1] = 0
-            ref_combined_x = ref_combine(ref_y, topk_idx, num_experts, bias, reduce_in_local=True)
+            ref_combined_x = ref_combine(
+                ref_y, topk_idx, num_experts, bias, reduce_in_local=True, use_fp32_output=args.use_fp32_output)
             del ref_y
             max_diff = (combined_x.float() - ref_combined_x.float()).abs().max().item()
             assert torch.equal(combined_x, ref_combined_x), f'{max_diff=}'
@@ -313,6 +319,7 @@ def test_dispatch_combine(buffer: deep_ep.EPBuffer, args: argparse.Namespace):
                     bias=bias,
                     num_sms=num_ai_cores,
                     async_with_compute_stream=True,
+                    use_fp32_output=args.use_fp32_output,
                 )
                 torch.npu.synchronize()
                 assert torch.equal(combined_x_without_weights, ref_combined_x)
@@ -379,7 +386,8 @@ def test_dispatch_combine(buffer: deep_ep.EPBuffer, args: argparse.Namespace):
                 cached_combined_x, cached_combined_weights, _ = launch(
                     buffer, 'combine', args.defer_epilogue,
                     x=input_for_combine, handle=cached_handle, topk_weights=cached_weights,
-                    bias=bias, num_sms=num_ai_cores, async_with_compute_stream=True)
+                    bias=bias, num_sms=num_ai_cores, async_with_compute_stream=True,
+                    use_fp32_output=args.use_fp32_output)
                 torch.npu.synchronize()
                 assert torch.equal(cached_combined_x, ref_combined_x)
                 if send_weights:
@@ -440,7 +448,7 @@ def test_dispatch_combine(buffer: deep_ep.EPBuffer, args: argparse.Namespace):
                     defer_epilogue=True,
                     **(cached_dispatch_args if use_cached else dispatch_args))
                 # Use the same cold-L2 epilogue setup in both profiling passes.
-                l2_dirty_buffer.zero_()
+                flush_l2_cache()
                 event.current_stream_wait(release_handle=True)
 
             dispatch_profile, dispatch_urma_profile, epilogue_profile = benchmark(
@@ -485,8 +493,9 @@ def test_dispatch_combine(buffer: deep_ep.EPBuffer, args: argparse.Namespace):
                     num_sms=num_ai_cores,
                     async_with_compute_stream=True,
                     defer_epilogue=True,
+                    use_fp32_output=args.use_fp32_output,
                 )
-                l2_dirty_buffer.zero_()
+                flush_l2_cache()
                 event.current_stream_wait(release_handle=True)
                 torch.npu.synchronize()
 
@@ -495,7 +504,7 @@ def test_dispatch_combine(buffer: deep_ep.EPBuffer, args: argparse.Namespace):
                 kernel_names=['combine_impl', 'combine_reduce_epilogue_impl'],
             )
             num_combine_epilogue_bytes = (
-                num_epilogue_slots + (num_bias + 1) * num_tokens) * num_bytes_per_combine_token
+                num_epilogue_slots + (num_bias + 1 + args.use_fp32_output) * num_tokens) * num_bytes_per_combine_token
             dist_print(f'   * EP: {buffer.rank_idx:3}/{buffer.num_ranks:3} | '
                        f'combine: {combine_profile.us:.3f} us | '
                        f'urma: {combine_urma_profile.us:.3f} us, '
@@ -562,6 +571,7 @@ if __name__ == '__main__':
     parser.add_argument('--hidden', type=int, default=7168, help='Hidden dimension size')
     parser.add_argument('--num-topk', type=int, default=6, help='Number of top-k experts')
     parser.add_argument('--num-experts', type=int, default=256, help='Number of experts')
+    parser.add_argument('--use-fp32-output', action='store_true', help='Return FP32 combine output instead of BF16')
 
     # Scenario settings
     parser.add_argument('--do-cpu-sync', type=int, default=1, help='Whether to do CPU sync')
@@ -582,8 +592,11 @@ if __name__ == '__main__':
                         help='Whether to reuse EP buffer for each test')
     parser.add_argument('--test-first-only', action='store_true', help='Only test the first case')
     parser.add_argument('--unbalanced-ratio', type=float, default=1.0, help='The MoE unbalanced ratio')
-    parser.add_argument('--precise-unbalanced-ratio', action='store_true',
-                        help='Generate top-k indices with precise unbalanced ratio')
+    routing_modes = parser.add_mutually_exclusive_group()
+    routing_modes.add_argument('--precise-unbalanced-ratio', action='store_true',
+                               help='Generate top-k indices with precise unbalanced ratio')
+    routing_modes.add_argument('--synthetic-unbalanced-ratio', action='store_true',
+                               help='Generate synthetic top-k routing with calibrated rank load')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     args = parser.parse_args()
 

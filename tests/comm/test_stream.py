@@ -7,6 +7,27 @@ import deep_ep
 from deep_ep.utils.envs import dist_print, init_dist
 
 
+def test_event_hook_is_released_when_it_fails():
+    class FailingEvent:
+        def current_stream_wait(self):
+            return None
+
+    event = deep_ep.EventOverlap(FailingEvent())
+
+    def fail():
+        raise RuntimeError('epilogue failed')
+
+    event.register_hook_after_wait(fail)
+    try:
+        event.current_stream_wait(release_handle=True)
+    except RuntimeError as error:
+        assert str(error) == 'epilogue failed'
+    else:
+        raise AssertionError('the failing epilogue did not raise')
+    assert event.hook_after_wait is None
+    assert event.event is None
+
+
 def test_events(producer, consumer, comm_stream):
     source = torch.zeros(4096, dtype=torch.float32, device='npu')
     torch.npu.synchronize()
@@ -124,7 +145,6 @@ def test(local_rank, num_local_ranks):
     test_ep(group, producer)
     assert torch.npu.current_stream() == original
     dist_print('Stream ordering and current-stream EP passed', once_in_node=True)
-    deep_ep.destroy_all_managed_hccl_comm()
     dist.destroy_process_group()
 
 
@@ -132,4 +152,5 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Test NPU stream ordering and tensor lifetime')
     parser.add_argument('--num-processes', type=int, default=2)
     args = parser.parse_args()
+    test_event_hook_is_released_when_it_fails()
     torch.multiprocessing.spawn(test, args=(args.num_processes,), nprocs=args.num_processes)

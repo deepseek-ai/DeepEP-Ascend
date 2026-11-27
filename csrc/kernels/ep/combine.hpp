@@ -22,7 +22,7 @@ static void* launch_combine(void* x,
                             void* buffer,
                             void* send_buffer,
                             void* workspace,
-                            void* jetty_ptrs,
+                            void* device_context,
                             const int& rank_idx, const int& num_ranks,
                             const int& num_max_tokens_per_rank,
                             const int& num_topk,
@@ -57,7 +57,7 @@ static void __instantiate_kernel() {{
         buffer,
         send_buffer,
         workspace,
-        jetty_ptrs,
+        device_context,
         rank_idx);
     return buffer;
 }
@@ -69,7 +69,8 @@ static void launch_combine_reduce_epilogue(void* combined_x,
                                            void* bias_0,
                                            void* bias_1,
                                            void* workspace,
-                                           void* jetty_ptrs,
+                                           void* device_context,
+                                           const int& rank_idx,
                                            const int& num_ranks,
                                            const int& num_combined_tokens,
                                            const int& num_max_tokens_per_rank,
@@ -78,6 +79,7 @@ static void launch_combine_reduce_epilogue(void* combined_x,
                                            const int& num_ub_bytes,
                                            const int& num_vec_cores,
                                            const int64_t& num_timeout_cycles,
+                                           const bool& use_fp32_output,
                                            const bool& do_barrier = true) {
     EP_HOST_ASSERT(num_vec_cores > 0);
     EP_HOST_ASSERT(num_ub_bytes > 0);
@@ -92,9 +94,9 @@ static void launch_combine_reduce_epilogue(void* combined_x,
 using namespace deep_ep;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
-)", num_ranks, num_experts, num_topk,
+)", use_fp32_output, num_ranks, num_experts, num_topk,
         hidden, num_max_tokens_per_rank, num_ub_bytes, num_vec_cores, num_timeout_cycles, do_barrier));
 
     // Launch
@@ -107,7 +109,8 @@ static void __instantiate_kernel() {{
         bias_0,
         bias_1,
         workspace,
-        jetty_ptrs,
+        device_context,
+        rank_idx,
         num_combined_tokens);
 }
 

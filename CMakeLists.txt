@@ -46,8 +46,8 @@ link_directories(
     ${TORCH_NPU_INSTALL_PREFIX}/lib
 )
 
-pybind11_add_module(_C csrc/python_api.cpp)
-target_link_libraries(_C PRIVATE ${TORCH_LIBRARIES} torch_python ascendcl hccl hcomm torch_npu)
+pybind11_add_module(_C csrc/python_api.cpp csrc/comm/topology.cpp)
+target_link_libraries(_C PRIVATE ${TORCH_LIBRARIES} torch_python ascendcl hcomm torch_npu topoaddrinfo)
 target_link_options(_C PRIVATE "-Wl,-Bsymbolic-functions")
 
 # For CLion indexing only (not compiled in production)

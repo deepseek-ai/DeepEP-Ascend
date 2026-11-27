@@ -14,7 +14,6 @@ from .allocator import BufferAllocator
 from .base import BufferBase
 from .. import comm
 from ..utils.event import EventOverlap
-from ..utils.math import align
 from ..utils.semantic import value_or
 
 
@@ -191,9 +190,9 @@ class EPBuffer(BufferBase):
                  *, use_huge1g_page: bool = True):
         """Create an EP buffer with the NV 2.5 argument order.
 
-        Ascend uses a single HCCL domain. Hybrid and
-        overlap preferences are compatibility options. LB storage can be allocated;
-        LB kernels, RDMA service levels and explicit QP counts are unsupported. ``num_bytes`` excludes
+        Ascend EP uses a single scaleup domain. Hybrid and
+        overlap preferences are compatibility options. LB storage supports weight prefetch and gradient reduction;
+        RDMA service levels and explicit QP counts are unsupported. ``num_bytes`` excludes
         workspace and must be allocation-aligned.
         """
         lb_allocation_plan = lb_allocation_plan_or_num_bytes if isinstance(lb_allocation_plan_or_num_bytes, BufferAllocator) else None
@@ -221,15 +220,14 @@ class EPBuffer(BufferBase):
             num_bytes = self.get_buffer_size_hint(
                 group, num_max_tokens_per_rank, hidden, num_topk, use_fp8_dispatch,
                 allow_hybrid_mode, allow_multiple_reduction)
-        assert num_bytes >= 0 and num_bytes % _C.get_num_allocation_alignment() == 0
+        assert num_bytes > 0 and num_bytes % _C.get_num_allocation_alignment() == 0
         self.num_bytes = num_bytes
         if os.environ.get('EP_BUFFER_DEBUG', 0):
             print(f'Initializing EP buffer with {num_bytes} bytes at rank EP {self.rank_idx}/{self.num_ranks}')
 
-        self.hccl_comm_handle = comm.get_hccl_comm_handle(group)
         super().__init__(explicitly_destroy)
         self.runtime = _C.EPBuffer(
-            self.rank_idx, self.num_ranks, self.hccl_comm_handle.get(),
+            self.rank_idx, self.num_ranks, group,
             num_bytes, num_lb_bytes, use_huge1g_page, num_cpu_timeout_secs, num_gpu_timeout_secs,
             explicitly_destroy)
         self.context = self.runtime.context
@@ -243,10 +241,17 @@ class EPBuffer(BufferBase):
         dist.barrier(group)
         torch.npu.synchronize()
 
+    def reset(self) -> None:
+        """Discard aborted counters while retaining buffers and communication links.
+
+        Stop old work and restore the device and communication on all ranks first.
+        Wait for every rank to finish resetting before starting new work.
+        """
+        self.runtime.reset()
+
     def destroy(self) -> None:
         super().destroy()
         self.context = None
-        self.hccl_comm_handle = None
 
     @staticmethod
     def get_buffer_size_hint(group: dist.ProcessGroup,
@@ -301,6 +306,42 @@ class EPBuffer(BufferBase):
             event_handle: the recorded NPU event.
         """
         return EventHandle()
+
+    def resize(self,
+               num_bytes: int,
+               lb_allocation_plan_or_num_bytes: Union[BufferAllocator, int]) -> None:
+        """
+        Resize the buffer to a positive, allocation-aligned token buffer size.
+        Collective: all ranks must call with the same sizes on a live buffer.
+        Complete all deferred epilogues before calling. Existing buffer views must
+        be reacquired after resizing; only the overlap of each region is preserved.
+
+        Arguments:
+            num_bytes: the new dispatch/combine buffer size in bytes, excluding workspace.
+            lb_allocation_plan_or_num_bytes: the new LB buffer size in bytes, or a buffer allocator.
+        """
+        assert num_bytes > 0 and num_bytes % _C.get_num_allocation_alignment() == 0
+        lb_allocation_plan = lb_allocation_plan_or_num_bytes if isinstance(lb_allocation_plan_or_num_bytes, BufferAllocator) else None
+        num_lb_bytes = lb_allocation_plan_or_num_bytes if lb_allocation_plan is None else lb_allocation_plan.num_bytes
+        if lb_allocation_plan is not None:
+            assert not lb_allocation_plan.materialized
+        assert isinstance(num_lb_bytes, int) and num_lb_bytes >= 0
+        assert num_lb_bytes % _C.get_num_allocation_alignment() == 0
+
+        comm.barrier(self, wait_comm_stream=True, with_cpu_sync=True, sequential=True)
+        dist.barrier(self.group)
+        torch.npu.synchronize()
+
+        self.runtime.resize(num_bytes, num_lb_bytes)
+        self.num_bytes = num_bytes
+        self.num_lb_bytes = num_lb_bytes
+        if lb_allocation_plan is not None:
+            lb_allocation_plan.materialize(self.runtime.lb_storage)
+
+        # Peers must finish copying and rebinding signals before anyone uses them.
+        torch.npu.synchronize()
+        dist.barrier(self.group)
+        torch.npu.synchronize()
 
     def get_theoretical_num_sms(self, num_experts: int, num_topk: int,
                                 num_scaleout_topk: int = 0,
@@ -528,7 +569,8 @@ class EPBuffer(BufferBase):
                 previous_event: EventHandle = None,
                 async_with_compute_stream: bool = False,
                 allocate_on_comm_stream: bool = False,
-                defer_epilogue: bool = False) \
+                defer_epilogue: bool = False,
+                use_fp32_output: bool = False) \
             -> Union[Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap], EventOverlap]:
         """
         Combine (reduce) tokens from different ranks back to their original ranks.
@@ -548,10 +590,12 @@ class EPBuffer(BufferBase):
             allocate_on_comm_stream: compatibility parameter; allocations use the current stream on Ascend.
             defer_epilogue: whether to defer the reduce epilogue until `event.current_stream_wait()` is called.
                 This requires `async_with_compute_stream=True`.
+            use_fp32_output: whether to output the final reduced tokens in FP32 instead of BF16.
 
         Returns:
             combined_x: the reduced token tensor, with shape `[num_combined_tokens, hidden]` and type
-                `torch.bfloat16`. Only returned when `defer_epilogue=False`.
+                `torch.float32` if `use_fp32_output=True`, otherwise `torch.bfloat16`.
+                Only returned when `defer_epilogue=False`.
             combined_topk_weights: the reduced top-k weights, with shape `[num_combined_tokens, num_topk]`
                 and type `torch.float`. Only returned when `defer_epilogue=False`.
             event: the communication event (valid only if `async_with_compute_stream` is set).
@@ -578,6 +622,7 @@ class EPBuffer(BufferBase):
             async_with_compute_stream,
             allocate_on_comm_stream,
             defer_epilogue,
+            use_fp32_output,
         )
         event_overlap = EventOverlap(event)
 
@@ -592,7 +637,33 @@ class EPBuffer(BufferBase):
         return combined_x, combined_topk_weights, event_overlap
 
     def lb_get_theoretical_num_sms(self) -> int:
-        return _C.get_num_ai_cores()
+        return 1
+
+    def lb_get_redundancy_mapping(self,
+                                  topk_idx: torch.Tensor,
+                                  num_experts: int,
+                                  num_redundant_experts_per_rank: int,
+                                  token_alignment: int = 16,
+                                  num_sms: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Count routes, balance the aligned expert loads and remap the logical expert ids.
+
+        Collective over one supernode, on the current stream.
+
+        Arguments:
+            topk_idx: contiguous `[num_tokens, num_topk]` `deep_ep.topk_idx_t` routes; negative entries are preserved.
+            num_experts: the total number of logical experts, divisible by the EP size.
+            num_redundant_experts_per_rank: required redundant slot count, between 0 and the number
+                of main experts per rank.
+            token_alignment: token alignment granularity per expert; 1 balances individual routes.
+            num_sms: the number of AI cores to launch on; 0 uses all AI cores.
+
+        Returns:
+            remapped_topk_idx: the shape and dtype of `topk_idx`, using `num_experts + EP * Q` physical ids,
+                where Q is the supplied redundant slot count. Each rank owns `[main slots, redundant slots]`.
+            redundancy_mapping: domain-local int32 `[num_nvlink_ranks, Q]` for `lb_prefetch_weights` and
+                `lb_reduce_grads`, with -1 for unused slots.
+        """
+        return self.runtime.lb_get_redundancy_mapping(topk_idx, num_experts, num_redundant_experts_per_rank, token_alignment, num_sms)
 
     def lb_prefetch_weights(self,
                             redundant_expert_weights: Sequence[torch.Tensor] | torch.Tensor,
@@ -602,29 +673,33 @@ class EPBuffer(BufferBase):
                             previous_event: Optional[EventHandle] = None) -> EventOverlap:
         """Push this rank's expert weights into the redundant expert slots requested by peers.
 
-        Collective: every rank in the LSA domain must call it, and the fused barriers make the redundant weights
-        visible to their users by the time the returned event is waited on.
+        Collective: every rank in the LSA domain must call it and wait on the returned handle.
+        Issue only submits requests; `wait()` enqueues CQ draining and the exit barrier on the current stream.
         Tensor sequences must be nonempty and contain no `None` entries.
 
         Arguments:
-            redundant_expert_weights: each tensor is a contiguous `[num_redundant_experts, *shape]`
+            redundant_expert_weights: each tensor is a contiguous `[num_redundant_experts_per_rank, *shape]`
                 destination and must reside in this buffer's LB region.
             expert_weights: each tensor is a contiguous `[num_local_experts, *shape]` source with at least
                 one dimension and a positive `num_local_experts`. Bytes per expert must match its
                 destination and be a multiple of `deep_ep.get_num_tma_alignment()`; the trailing shapes may differ.
-            redundancy_mapping: `[num_nvlink_ranks, num_redundant_experts]` int32, identical on every rank in the LSA domain;
+            redundancy_mapping: `[num_nvlink_ranks, num_redundant_experts_per_rank]` int32, identical on every rank in the LSA domain;
                 entry `[r, c]` is the expert id assigned to redundant slot `c` on LSA rank `r`, or -1 if empty.
                 Expert ids are local to the LSA domain, in [0, num_nvlink_ranks * num_local_experts).
-            num_sms: the number of SMs to use; 0 uses `lb_get_theoretical_num_sms()`.
+            num_sms: the number of AI cores to use; 0 uses `lb_get_theoretical_num_sms()`.
             previous_event: compatibility parameter; ignored on Ascend.
         """
         redundant_expert_weights = ([redundant_expert_weights] if isinstance(redundant_expert_weights, torch.Tensor)
                                     else list(redundant_expert_weights))
         expert_weights = [expert_weights] if isinstance(expert_weights, torch.Tensor) else list(expert_weights)
 
-        num_sms = self.lb_get_theoretical_num_sms() if num_sms == 0 else align(num_sms, 2)
-        return EventOverlap(self.runtime.lb_prefetch_weights(
-            redundant_expert_weights, expert_weights, redundancy_mapping, num_sms, previous_event))
+        num_sms = self.lb_get_theoretical_num_sms() if num_sms == 0 else num_sms
+        event, epilogue = self.runtime.lb_prefetch_weights(
+            redundant_expert_weights, expert_weights, redundancy_mapping, num_sms, previous_event)
+        handle = EventOverlap(event, extra_tensors=tuple(redundant_expert_weights) + tuple(expert_weights) +
+                              (redundancy_mapping, self.runtime.lb_storage))
+        handle.register_hook_after_wait(epilogue)
+        return handle
 
     def lb_reduce_grads(self,
                         redundant_expert_grads: torch.Tensor,
@@ -636,14 +711,18 @@ class EPBuffer(BufferBase):
 
         The mirror of `lb_prefetch_weights`: use the same redundancy mapping to return gradients.
         Collective, and it adds rather than overwrites, so seed `expert_grads` before calling.
+        Issue only submits requests; `wait()` enqueues CQ draining and the exit barrier on the current stream.
 
         Arguments:
-            redundant_expert_grads: `[num_redundant_experts, hidden]` fp32 redundant gradients that must reside in this buffer's LB region.
+            redundant_expert_grads: `[num_redundant_experts_per_rank, hidden]` fp32 redundant gradients that must reside in this buffer's LB region.
             expert_grads: `[num_local_experts, hidden]` fp32 destination, accumulated into.
             redundancy_mapping: see `lb_prefetch_weights`.
-            num_sms: the number of SMs to use; 0 uses `lb_get_theoretical_num_sms()`.
+            num_sms: the number of AI cores to use; 0 uses `lb_get_theoretical_num_sms()`.
             previous_event: compatibility parameter; ignored on Ascend.
         """
-        num_sms = self.lb_get_theoretical_num_sms() if num_sms == 0 else align(num_sms, 2)
-        return EventOverlap(self.runtime.lb_reduce_grads(
-            redundant_expert_grads, expert_grads, redundancy_mapping, num_sms, previous_event))
+        num_sms = self.lb_get_theoretical_num_sms() if num_sms == 0 else num_sms
+        event, epilogue = self.runtime.lb_reduce_grads(
+            redundant_expert_grads, expert_grads, redundancy_mapping, num_sms, previous_event)
+        handle = EventOverlap(event, extra_tensors=(redundant_expert_grads, expert_grads, redundancy_mapping, self.runtime.lb_storage))
+        handle.register_hook_after_wait(epilogue)
+        return handle

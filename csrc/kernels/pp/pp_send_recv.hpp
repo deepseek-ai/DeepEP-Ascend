@@ -7,7 +7,7 @@
 namespace deep_ep {
 
 static void launch_pp_send(void* x, const int64_t& num_x_bytes,
-                           void* buffer, void* workspace, void* jetty_ptrs,
+                           void* buffer, void* workspace, void* device_context,
                            const int& rank_idx, const int& dst_rank_idx, const int& num_ranks,
                            const int64_t& num_max_tensor_bytes,
                            const int& num_max_inflight_tensors,
@@ -29,13 +29,13 @@ static void __instantiate_kernel() {{
     jit->launch(
         kernel, {.num_blocks = num_blocks},
         x, num_x_bytes,
-        buffer, workspace, jetty_ptrs,
+        buffer, workspace, device_context,
         rank_idx, dst_rank_idx, num_ranks,
         num_max_tensor_bytes, num_max_inflight_tensors);
 }
 
 static void launch_pp_recv(void* x, const int64_t& num_x_bytes,
-                           void* buffer, void* workspace, void* jetty_ptrs,
+                           void* buffer, void* workspace, void* device_context,
                            const int& rank_idx, const int& src_rank_idx, const int& num_ranks,
                            const int64_t& num_max_tensor_bytes,
                            const int& num_max_inflight_tensors,
@@ -57,7 +57,7 @@ static void __instantiate_kernel() {{
     jit->launch(
         kernel, {.num_blocks = num_blocks},
         x, num_x_bytes,
-        buffer, workspace, jetty_ptrs,
+        buffer, workspace, device_context,
         rank_idx, src_rank_idx, num_ranks,
         num_max_tensor_bytes, num_max_inflight_tensors);
 }

@@ -3,6 +3,10 @@
 
 // Kernel implements
 #include <deep_ep/impls/bucket/all_gather/urma.hpp>
+#include <deep_ep/impls/bucket/all_reduce/urma.hpp>
+#include <deep_ep/impls/bucket/send_recv/urma.hpp>
+#include <deep_ep/impls/bucket/reduce_scatter/urma.hpp>
+#include <deep_ep/impls/bucket/reduce_scatter/epilogue.hpp>
 #include <deep_ep/impls/comm/barrier.hpp>
 #include <deep_ep/impls/ep/dispatch.hpp>
 #include <deep_ep/impls/ep/dispatch_copy_epilogue.hpp>

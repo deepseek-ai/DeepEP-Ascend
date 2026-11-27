@@ -2,6 +2,8 @@
 
 #include <cstdio>
 #include <memory>
+#include <vector>
+
 #include <pybind11/pybind11.h>
 
 #include "../kernels/comm/api.hpp"
@@ -34,6 +36,17 @@ public:
     virtual ~BufferBase() noexcept(false) = default;
     virtual void destroy() = 0;
 
+    // BucketBuffer overrides this pair to cover every context, not only the main one.
+    virtual std::vector<layout::ErrorCode> get_error_status() const {
+        EP_HOST_ASSERT(not destroyed and main_context != nullptr and "error record unavailable after destroy");
+        return {main_context->get_error_status()};
+    }
+
+    virtual void clear_error_status() const {
+        EP_HOST_ASSERT(not destroyed and main_context != nullptr and "error record unavailable after destroy");
+        main_context->clear_error_status();
+    }
+
     void print_memory_usage() const {
         EP_HOST_ASSERT(not destroyed and main_context != nullptr);
         const auto num_workspace_gibs = main_context->num_workspace_bytes / static_cast<float>(1 << 30);
@@ -57,6 +70,8 @@ static void register_apis(pybind11::module_& m) {
     pybind11::class_<BufferBase>(m, "BufferBase")
         .def_readonly("main_context", &BufferBase::main_context)
         .def("print_memory_usage", &BufferBase::print_memory_usage)
+        .def("get_error_status", &BufferBase::get_error_status)
+        .def("clear_error_status", &BufferBase::clear_error_status)
         .def("destroy", &BufferBase::destroy);
 }
 

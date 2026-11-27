@@ -4,6 +4,7 @@
 #include <deep_ep/common/compiled.hpp>
 #include <deep_ep/layout/ep/token.hpp>
 #include <deep_ep/layout/ep/workspace.hpp>
+#include <deep_ep/layout/common/context.hpp>
 #include <deep_ep/common/exception.hpp>
 #include <deep_ep/common/math.hpp>
 
@@ -181,7 +182,7 @@ template <int kNumRanks, int kNumExperts, int kNumTopk, int kExpertAlignment,
 __global__ __vector__ void dispatch_copy_epilogue_impl(
     __gm__ void* buffer,
     __gm__ void* workspace,
-    __gm__ void* jetty_ptrs,
+    __gm__ void* device_context_ptr,
     __gm__ int* psum_num_recv_tokens_per_rank,
     __gm__ int* psum_num_recv_tokens_per_expert,
     __gm__ void* recv_x,
@@ -195,13 +196,14 @@ __global__ __vector__ void dispatch_copy_epilogue_impl(
     AscendC::InitSocState();
 
     const auto vec_core_idx = static_cast<int>(AscendC::GetBlockIdx());
+    auto* device_context = static_cast<__gm__ layout::DeviceContext*>(device_context_ptr);
     const auto workspace_layout = layout::EPWorkspaceLayout(workspace);
     if constexpr (kDoBarrier)
         comm::scalar::barrier<
-            kNumRanks, kNumTimeoutCycles, true, true, true, kNumVecCores, kNumVecCores>(
-                workspace_layout.get_common_signals(), vec_core_idx, jetty_ptrs);
+            kNumRanks, kNumRanks, kNumTimeoutCycles, true, true, true, kNumVecCores, kNumVecCores>(
+                workspace_layout.get_barrier_signals(), *device_context, vec_core_idx, rank_idx);
 
-    EP_STATIC_ASSERT(kNumRanks <= kNumMaxRanks);
+    EP_STATIC_ASSERT(kNumRanks <= kNumMaxEPRanks);
     EP_STATIC_ASSERT(kNumExperts % kNumRanks == 0);
     EP_STATIC_ASSERT(math::is_power_of_2(kExpertAlignment));
     EP_STATIC_ASSERT(kNumVecCores > 0);
@@ -242,7 +244,6 @@ __global__ __vector__ void dispatch_copy_epilogue_impl(
         (kNumUBBytes - kNumExpertStateBytes - kNumMetadataPipelineBytes -
          (kDoZeroPadding ? kNumZeroBytes : 0)) / (kNumTokenBytes * kNumTokensPerStage));
 
-    EP_STATIC_ASSERT(not kDoZeroPadding or kNumHiddenBytes % kNumZeroBytes == 0);
     EP_STATIC_ASSERT(kNumExpertsPerRank <= 512);
     EP_STATIC_ASSERT(kNumMaxHistogramTokensPerStage * kNumTopk <= 65535);
     EP_STATIC_ASSERT(kNumExpertStateBytes + kNumHistogramStages * kNumHistogramStageBytes <= kNumUBBytes);
@@ -562,15 +563,25 @@ __global__ __vector__ void dispatch_copy_epilogue_impl(
                 if (num_part_tokens == 0)
                     continue;
 
+                const auto gm_recv_x = (__gm__ uint8_t*)recv_x +
+                    static_cast<int64_t>(expert_token_end_idx + pad_token_start_idx) * kNumHiddenBytes;
                 asc_set_ub2gm_loop_size(num_part_tokens, 1);
                 asc_set_ub2gm_loop1_stride(0, kNumHiddenBytes);
-                asc_copy_ub2gm_align(
-                    (__gm__ uint8_t*)recv_x + static_cast<int64_t>(expert_token_end_idx + pad_token_start_idx) * kNumHiddenBytes,
-                    ub_zero_buffer,
-                    kNumHiddenBytes / kNumZeroBytes,
-                    kNumZeroBytes,
-                    static_cast<uint8_t>(ST_L2CacheType::L2_CACHE_HINT_NORMAL_FV), kNumZeroBytes, 0
-                );
+                if constexpr (kNumHiddenBytes >= kNumZeroBytes) {
+                    asc_copy_ub2gm_align(
+                        gm_recv_x, ub_zero_buffer,
+                        kNumHiddenBytes / kNumZeroBytes, kNumZeroBytes,
+                        static_cast<uint8_t>(ST_L2CacheType::L2_CACHE_HINT_NORMAL_FV), kNumZeroBytes, 0
+                    );
+                }
+                if constexpr (kNumHiddenBytes % kNumZeroBytes > 0) {
+                    asc_copy_ub2gm_align(
+                        gm_recv_x + kNumHiddenBytes / kNumZeroBytes * kNumZeroBytes,
+                        ub_zero_buffer,
+                        1, kNumHiddenBytes % kNumZeroBytes,
+                        static_cast<uint8_t>(ST_L2CacheType::L2_CACHE_HINT_NORMAL_FV), kNumHiddenBytes % kNumZeroBytes, 0
+                    );
+                }
                 asc_set_ub2gm_loop_size(1, 1);
 
                 if (recv_topk_weights != nullptr) {

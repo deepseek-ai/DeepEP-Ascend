@@ -63,11 +63,12 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         local_storages.append(local_storage)
     buffer.write(local_storages, sfs=sfs)
 
-    # Generate random indices with a per-layer global entry range
+    domain_start = rank_idx - buffer.scaleup_rank_idx
+
     def generate_indices():
         return torch.stack([
             torch.randint(
-                0, num_ranks * num_entries,
+                domain_start * num_entries, (domain_start + buffer.num_scaleup_ranks) * num_entries,
                 (args.num_tokens, args.num_entries_per_token),
                 dtype=torch.int, device='npu')
             for num_entries in num_entries_per_layer

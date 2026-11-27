@@ -31,35 +31,43 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     base::register_apis(m);
 
     py::class_<EPBuffer, BufferBase>(m, "EPBuffer")
-        .def(py::init<int, int, std::string, int64_t, int64_t, bool, int, int, bool>())
+        .def(py::init<int, int, comm::ProcessGroup, int64_t, int64_t, bool, int, int, bool>())
         .def_readonly("context", &EPBuffer::context)
         .def_readonly("lb_storage", &EPBuffer::lb_storage)
+        .def("reset", &EPBuffer::reset)
+        .def("resize", &EPBuffer::resize)
+        .def("lb_get_redundancy_mapping", &EPBuffer::lb_get_redundancy_mapping)
         .def("lb_prefetch_weights", &EPBuffer::lb_prefetch_weights)
         .def("lb_reduce_grads", &EPBuffer::lb_reduce_grads)
         .def("dispatch", &EPBuffer::dispatch)
         .def("combine", &EPBuffer::combine);
 
     py::class_<PPBuffer, BufferBase>(m, "PPBuffer")
-        .def(py::init<int, int, std::string, int64_t, int, bool, int, bool>())
+        .def(py::init<int, int, comm::ProcessGroup, int64_t, int, bool, int, bool>())
         .def_readonly("context", &PPBuffer::context)
         .def_readonly("storage", &PPBuffer::storage)
         .def("send", &PPBuffer::send)
         .def("recv", &PPBuffer::recv);
 
     py::class_<EngramBuffer, BufferBase>(m, "EngramBuffer")
-        .def(py::init<int, int, std::string, int64_t, int64_t, bool, int, bool>())
+        .def(py::init<int, int, comm::ProcessGroup, int64_t, int64_t, bool, int, bool>())
         .def_readonly("context", &EngramBuffer::context)
         .def("set_config", &EngramBuffer::set_config)
         .def("write", &EngramBuffer::write)
         .def("fetch", &EngramBuffer::fetch);
 
     py::class_<BucketBuffer, BufferBase>(m, "BucketBuffer")
-        .def(py::init<std::vector<int>, std::vector<int>, std::vector<std::string>, int64_t, bool, int, bool>())
+        .def(py::init<int64_t, bool, int, bool>())
         .def_readonly("contexts", &BucketBuffer::contexts)
         .def_readonly("storage", &BucketBuffer::storage)
+        .def_property_readonly("active", &BucketBuffer::is_active)
+        .def("invalidate", &BucketBuffer::invalidate)
+        .def("configure", &BucketBuffer::configure)
+        .def("send_recv", &BucketBuffer::send_recv)
         .def("reduce_scatter", &BucketBuffer::reduce_scatter)
         .def("all_reduce", &BucketBuffer::all_reduce)
-        .def("all_gather", &BucketBuffer::all_gather);
+        .def("all_gather", &BucketBuffer::all_gather)
+        .def("ring_send_recv", &BucketBuffer::ring_send_recv);
 
     m.def("calculate_ep_buffer_size", &EPBuffer::calculate_buffer_size);
     m.def("get_num_allocation_alignment", []() {
