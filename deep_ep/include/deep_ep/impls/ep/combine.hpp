@@ -5,6 +5,7 @@
 #include <deep_ep/comm/handle.hpp>
 #include <deep_ep/impls/ep/combine_utils.hpp>
 #include <deep_ep/layout/ep/workspace.hpp>
+#include <deep_ep/layout/common/context.hpp>
 #include <deep_ep/common/bitset.hpp>
 #include <deep_ep/common/exception.hpp>
 #include <deep_ep/common/math.hpp>
@@ -151,11 +152,12 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumTokensPerTask * warpSize) void load
 
 template <int kNumRanks>
 __simt_vf__ __aicore__ __launch_bounds__(math::align(kNumRanks, warpSize))
-void load_combine_peers(__ubuf__ handle::HcommPeerInfo* peers, __gm__ void* jetty_ptrs, const int rank_idx) {
+void load_combine_peers(__ubuf__ handle::HcommPeerInfo* peers, __gm__ void* jetty_ptrs, const int rank_idx,
+                        __gm__ layout::ErrorStatusSlot* error_status) {
     const auto peer_idx = static_cast<int>(threadIdx.x);
     if (peer_idx < kNumRanks and peer_idx != rank_idx)
         handle::HcommPeerInfo::load_peer_info(peers + peer_idx, static_cast<__gm__ const uint64_t*>(jetty_ptrs),
-                              peer_idx < rank_idx ? peer_idx : peer_idx - 1);
+                              peer_idx < rank_idx ? peer_idx : peer_idx - 1, error_status);
 }
 
 template <int kNumRanks, int kNumTopk, int kHidden, int kNumMaxTokensPerRank, int kNumVecCores,
@@ -163,9 +165,11 @@ template <int kNumRanks, int kNumTopk, int kHidden, int kNumMaxTokensPerRank, in
           bool kDoBarrier = false, bool kHasTopkWeights = true>
 __global__ __vector__ void combine_impl(__gm__ bfloat16_t* x, __gm__ float* topk_weights, __gm__ int* src_metadata,
                                         __gm__ int* psum_num_recv_tokens_per_rank, __gm__ uint8_t* combine_recv_buffer,
-                                        __gm__ uint8_t* send_buffer, __gm__ void* workspace, __gm__ void* jetty_ptrs,
+                                        __gm__ uint8_t* send_buffer, __gm__ void* workspace, __gm__ void* device_context_ptr,
                                         const int rank_idx) {
     AscendC::InitSocState();
+    auto* device_context = static_cast<__gm__ layout::DeviceContext*>(device_context_ptr);
+    const auto error_status = layout::DeviceContext::get_error_status(*device_context);
 
     constexpr auto kNumTokensPerTask = 8;
     constexpr auto kNumStages = 2;
@@ -183,7 +187,7 @@ __global__ __vector__ void combine_impl(__gm__ bfloat16_t* x, __gm__ float* topk
     EP_STATIC_ASSERT(kNumTokensPerTask <= 8);
     EP_STATIC_ASSERT(kNumTopk <= UBLayout::kNumHiddenRingSlots, "Combine UB cannot hold top-k inputs");
     EP_STATIC_ASSERT(kNumVecCores > 0);
-    EP_STATIC_ASSERT(kNumRanks <= kNumMaxRanks);
+    EP_STATIC_ASSERT(kNumRanks <= kNumMaxEPRanks);
     EP_STATIC_ASSERT(kNumMaxTokensPerRank > 0);
 
     // The padded task bound also covers the final alignment NOP WQEs.
@@ -200,12 +204,16 @@ __global__ __vector__ void combine_impl(__gm__ bfloat16_t* x, __gm__ float* topk
     EP_STATIC_ASSERT(sizeof(UBLayout) <= kNumUbBytes, "Combine task stages and hidden ring exceed UB capacity");
     __ubuf__ UBLayout* ub = 0;
 
-    comm::scalar::barrier<kNumRanks, kNumTimeoutCycles, false>(signals.common_signals, vec_core_idx);
+    comm::scalar::barrier<kNumRanks, kNumRanks, kNumTimeoutCycles, false>(
+        signals.barrier_signals, *device_context, vec_core_idx, rank_idx);
 
-    handle::HcommJetty jetty(&ub->jetty_info, nullptr, jetty_ptrs, vec_core_idx);
+    handle::HcommJetty jetty(&ub->jetty_info, nullptr,
+                             kNumRanks > 1 ? device_context->scaleup_jetties : nullptr, vec_core_idx,
+                             error_status);
     if constexpr (kNumRanks > 1) {
         asc_vf_call<load_combine_peers<kNumRanks>>(
-            dim3(math::align(kNumRanks, warpSize), 1, 1), ub->peer_infos, jetty_ptrs, rank_idx);
+            dim3(math::align(kNumRanks, warpSize), 1, 1), ub->peer_infos, device_context->scaleup_jetties, rank_idx,
+            error_status);
         asc_sync_notify(PIPE_V, PIPE_S, EVENT_ID0);
         asc_sync_wait(PIPE_V, PIPE_S, EVENT_ID0);
     }
@@ -359,8 +367,8 @@ __global__ __vector__ void combine_impl(__gm__ bfloat16_t* x, __gm__ float* topk
 
     if constexpr (kDoBarrier)
         comm::scalar::barrier<
-            kNumRanks, kNumTimeoutCycles, true, false, true, kNumVecCores, kNumVecCores>(
-                signals.common_signals, vec_core_idx, jetty_ptrs);
+            kNumRanks, kNumRanks, kNumTimeoutCycles, true, false, true, kNumVecCores, kNumVecCores>(
+                signals.barrier_signals, *device_context, vec_core_idx, rank_idx);
 }
 
 } // namespace deep_ep

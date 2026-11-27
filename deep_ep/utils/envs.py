@@ -60,20 +60,6 @@ def dist_print(s: str = '', once_in_node: bool = False) -> None:
     dist.barrier()
 
 
-def get_hccl_group_name(group: dist.ProcessGroup, rank_idx: int) -> str:
-    """
-    Extract the HCCL communicator name from a process group.
-
-    Arguments:
-        group: the HCCL-backed process group.
-        rank_idx: the rank index within the group.
-
-    Returns:
-        group_name: the string identifier used by `HcclCommGetHandleWithName`.
-    """
-    return group._get_backend(torch.device('npu')).get_hccl_comm_name(rank_idx)
-
-
 def init_dist(local_rank: int, num_local_ranks: int, seed: int = 0) -> \
         Tuple[int, int, dist.ProcessGroup]:
     """

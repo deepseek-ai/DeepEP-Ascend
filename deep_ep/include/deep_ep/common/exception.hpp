@@ -4,8 +4,12 @@
 #include <string>
 #include <sstream>
 
+#include <deep_ep/common/compiled.hpp>
+
+#ifndef EP_AICPU
 // TODO(HUAWEI): do we have a better include path?
 #include <utils/debug/asc_assert.h>
+#endif
 
 #ifndef EP_STATIC_ASSERT
 #define EP_STATIC_ASSERT(cond, ...) static_assert(cond, "" __VA_ARGS__)
@@ -37,6 +41,8 @@ public:
 
 #ifdef __CLION_IDE__
 #define EP_DEVICE_ASSERT(cond) void()
+#elif defined(EP_AICPU)
+#define EP_DEVICE_ASSERT(cond) EP_HOST_ASSERT(cond)
 #else
 #define EP_DEVICE_ASSERT(cond) assert(cond)
 #endif
@@ -57,18 +63,7 @@ public:
     } while (0)
 #endif
 
-#ifndef HCCL_CHECK
-#define HCCL_CHECK(cmd) \
-    do { \
-        const auto e = (cmd); \
-        if (e != HCCL_SUCCESS) { \
-            std::stringstream ss; \
-            ss << "Error code: " << static_cast<int>(e) << ", detail: " << HcclGetErrorString(e); \
-            throw EPException("HCCL runtime", __FILE__, __LINE__, ss.str()); \
-        } \
-    } while (0)
-#endif
-
+// CANN declares HcclGetErrorString in its HCCL headers and exports it from libhcomm.so, so linking libhccl.so is not required.
 #ifndef HCOMM_CHECK
 #define HCOMM_CHECK(cmd) \
     do { \

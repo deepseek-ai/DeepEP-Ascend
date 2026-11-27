@@ -20,7 +20,7 @@ public:
     std::shared_ptr<comm::Context> context;
     torch::Tensor storage;
 
-    PPBuffer(const int& rank_idx, const int& num_ranks, const std::string& hccl_group_name,
+    PPBuffer(const int& rank_idx, const int& num_ranks, const comm::ProcessGroup& group,
              const int64_t& num_max_tensor_bytes, const int& num_max_inflight_tensors,
              const bool& use_huge1g_page, const int& num_gpu_timeout_secs, const bool& explicitly_destroy):
         BufferBase(explicitly_destroy),
@@ -28,16 +28,17 @@ public:
         next_rank_idx((rank_idx + 1) % num_ranks),
         num_max_pp_tensor_bytes(math::align<int64_t>(num_max_tensor_bytes, kNumRDMAAlignmentBytes)),
         num_max_pp_inflight_tensors(num_max_inflight_tensors) {
+        EP_HOST_ASSERT(num_ranks <= kNumMaxScaleupRanks);
         EP_HOST_ASSERT(num_max_tensor_bytes > 0 and num_max_inflight_tensors > 0);
         EP_HOST_ASSERT(num_max_pp_tensor_bytes <= std::numeric_limits<uint32_t>::max());
         const auto num_storage_bytes = math::align<int64_t>(
             4 * num_max_pp_tensor_bytes * num_max_inflight_tensors, kNumAllocationAlignmentBytes);
         context = std::make_shared<comm::Context>(
-            hccl_group_name, rank_idx, num_ranks, sizeof(layout::PPSignals), num_storage_bytes, 0,
+            group, rank_idx, num_ranks, sizeof(layout::PPSignals), num_storage_bytes, 0,
             use_huge1g_page, 300, num_gpu_timeout_secs);
         main_context = context;
         auto& pp = *static_cast<layout::PPSignals*>(context->workspace);
-        context->set_common_signals(&pp.common_signals);
+        context->set_barrier_signals(&pp.barrier_signals);
         storage = torch::from_blob(context->buffer, {num_storage_bytes}, [context = context](void*) {},
                                    torch::TensorOptions().dtype(torch::kByte).device(TORCH_DEVICE_NPU));
     }
@@ -63,7 +64,7 @@ public:
 
         launch_pp_send(
             x.data_ptr(), x.nbytes(),
-            context->buffer, context->workspace, context->hccl_context->jetty_device_ptrs,
+            context->buffer, context->workspace, context->hcomm_context->device_context,
             context->rank_idx, dst_rank_idx, context->num_ranks,
             num_max_pp_tensor_bytes,
             num_max_pp_inflight_tensors,
@@ -80,7 +81,7 @@ public:
 
         launch_pp_recv(
             x.data_ptr(), x.nbytes(),
-            context->buffer, context->workspace, context->hccl_context->jetty_device_ptrs,
+            context->buffer, context->workspace, context->hcomm_context->device_context,
             context->rank_idx, src_rank_idx, context->num_ranks,
             num_max_pp_tensor_bytes,
             num_max_pp_inflight_tensors,

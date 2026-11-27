@@ -1,11 +1,11 @@
 #pragma once
 
-#include <deep_ep/layout/common/signals.hpp>
+#include <deep_ep/layout/barrier.hpp>
 
 namespace deep_ep::layout {
 
 struct alignas(kNumAllocationAlignmentBytes) EngramWorkspace {
-    CommonSignals common_signals;
+    BarrierSignals barrier_signals;
 };
 
 // Each layer has a packed storage shard and a fixed-size receive region.

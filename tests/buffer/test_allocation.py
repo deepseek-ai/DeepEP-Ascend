@@ -48,7 +48,6 @@ def test(local_rank: int, num_local_ranks: int) -> None:
     weights.fill_(rank_idx)
     assert (weights == rank_idx).all()
     buffer.destroy()
-    deep_ep.destroy_all_managed_hccl_comm()
     dist_print('Buffer allocation and group registration passed', once_in_node=True)
     dist.destroy_process_group()
 

@@ -28,18 +28,18 @@ class EngramBuffer: public BufferBase {
 public:
     std::shared_ptr<comm::Context> context;
 
-    EngramBuffer(const int& rank_idx, const int& num_ranks, const std::string& hccl_group_name,
+    EngramBuffer(const int& rank_idx, const int& num_ranks, const comm::ProcessGroup& group,
                  const int64_t& num_gpu_bytes, const int64_t& num_rdma_storage_bytes,
                  const bool& use_huge1g_page, const int& num_gpu_timeout_secs, const bool& explicitly_destroy):
         BufferBase(explicitly_destroy) {
         EP_HOST_ASSERT(num_gpu_bytes > 0 and num_gpu_bytes % kNumAllocationAlignmentBytes == 0);
         EP_HOST_ASSERT(num_rdma_storage_bytes > 0 and num_rdma_storage_bytes % kNumAllocationAlignmentBytes == 0);
         context = std::make_shared<comm::Context>(
-            hccl_group_name, rank_idx, num_ranks, sizeof(layout::EngramWorkspace), num_gpu_bytes,
+            group, rank_idx, num_ranks, sizeof(layout::EngramWorkspace), num_gpu_bytes,
             num_rdma_storage_bytes, use_huge1g_page, 300, num_gpu_timeout_secs);
         main_context = context;
         auto& workspace = *static_cast<layout::EngramWorkspace*>(context->workspace);
-        context->set_common_signals(&workspace.common_signals);
+        context->set_barrier_signals(&workspace.barrier_signals);
     }
 
     ~EngramBuffer() noexcept(false) override {
@@ -119,7 +119,8 @@ public:
             auto* sf_ptr = math::advance_ptr<void>(context->buffer, num_engram_recv_bytes);
             for (int layer_idx = 0; layer_idx < num_layers; ++ layer_idx) {
                 const auto& sf = sfs->at(layer_idx);
-                EP_HOST_ASSERT(sf.dim() == 2 and sf.size(0) == context->num_ranks * num_engram_entries_per_layer[layer_idx] and
+                EP_HOST_ASSERT(sf.dim() == 2 and
+                               sf.size(0) == static_cast<int64_t>(context->num_ranks) * num_engram_entries_per_layer[layer_idx] and
                                sf.size(1) == num_engram_sf_packs);
                 EP_HOST_ASSERT(sf.device().type() == TORCH_DEVICE_NPU and sf.is_contiguous() and sf.element_size() == sizeof(sf_pack_t));
 
@@ -189,10 +190,10 @@ public:
             context->local_rdma_storage_ptr,
             context->buffer,
             indices.data_ptr<int>(), context->workspace,
-            sf_ptr, fetched_sf_ptr,
+            context->hcomm_context->device_context, sf_ptr, fetched_sf_ptr,
             sf_token_stride, sf_hidden_stride, sf_layer_stride,
             num_engram_entries_per_layer,
-            context->num_ranks, engram_hidden * engram_elem_size,
+            context->rank_idx, context->hcomm_context->num_scaleup_ranks, engram_hidden * engram_elem_size,
             num_engram_sf_packs, num_entries_per_token,
             num_tokens, num_max_engram_tokens,
             static_cast<int>(runtime->get_num_ubuf_bytes_per_vec_core()),

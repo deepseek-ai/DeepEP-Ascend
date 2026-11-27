@@ -44,12 +44,11 @@ class PPBuffer(BufferBase):
         self.group = group
         self.rank_idx = group.rank()
         self.num_ranks = group.size()
-        self.hccl_comm_handle = comm.get_hccl_comm_handle(group)
         super().__init__(explicitly_destroy)
 
         # Create CPP runtime
         self.runtime = _C.PPBuffer(
-            group.rank(), group.size(), self.hccl_comm_handle.get(),
+            group.rank(), group.size(), group,
             num_max_tensor_bytes, num_max_inflight_tensors,
             use_huge1g_page, num_gpu_timeout_secs, explicitly_destroy)
         self.context = self.runtime.context
@@ -83,4 +82,3 @@ class PPBuffer(BufferBase):
         super().destroy()
         self.storage = None
         self.context = None
-        self.hccl_comm_handle = None

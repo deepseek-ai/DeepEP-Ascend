@@ -26,6 +26,7 @@ namespace deep_ep {
 
 class EPBuffer: public BufferBase {
     int64_t num_buffer_bytes;
+    int64_t num_lb_buffer_bytes;
     void* host_workspace = nullptr;
     void* mapped_host_workspace = nullptr;
 
@@ -33,20 +34,21 @@ public:
     std::shared_ptr<comm::Context> context;
     torch::Tensor lb_storage;
 
-    EPBuffer(const int& rank_idx, const int& num_ranks, const std::string& hccl_group_name,
+    EPBuffer(const int& rank_idx, const int& num_ranks, const comm::ProcessGroup& group,
              const int64_t& num_buffer_bytes, const int64_t& num_lb_buffer_bytes,
              const bool& use_huge1g_page,
              const int& num_cpu_timeout_secs, const int& num_gpu_timeout_secs,
              const bool& explicitly_destroy):
-        BufferBase(explicitly_destroy), num_buffer_bytes(num_buffer_bytes) {
-        EP_HOST_ASSERT(num_buffer_bytes >= 0 and num_buffer_bytes % kNumAllocationAlignmentBytes == 0);
+        BufferBase(explicitly_destroy), num_buffer_bytes(num_buffer_bytes), num_lb_buffer_bytes(num_lb_buffer_bytes) {
+        EP_HOST_ASSERT(num_ranks <= kNumMaxEPRanks);
+        EP_HOST_ASSERT(num_buffer_bytes > 0 and num_buffer_bytes % kNumAllocationAlignmentBytes == 0);
         EP_HOST_ASSERT(num_lb_buffer_bytes >= 0 and num_lb_buffer_bytes % kNumAllocationAlignmentBytes == 0);
         context = std::make_shared<comm::Context>(
-            hccl_group_name, rank_idx, num_ranks, sizeof(layout::EPSignals), num_buffer_bytes + num_lb_buffer_bytes, 0,
+            group, rank_idx, num_ranks, sizeof(layout::EPSignals), num_buffer_bytes + num_lb_buffer_bytes, 0,
             use_huge1g_page, num_cpu_timeout_secs, num_gpu_timeout_secs);
         main_context = context;
         auto& workspace = *static_cast<layout::EPSignals*>(context->workspace);
-        context->set_common_signals(&workspace.common_signals);
+        context->set_barrier_signals(&workspace.barrier_signals);
         lb_storage = torch::from_blob(
             context->buffer, {num_buffer_bytes + num_lb_buffer_bytes}, [context = context](void*) {},
             torch::TensorOptions().dtype(torch::kByte).device(TORCH_DEVICE_NPU)
@@ -62,9 +64,17 @@ public:
         destroy_on_destruction("EP");
     }
 
+    void reset() {
+        // All ranks must stop old work and restore the device before resetting.
+        // Preserve the symmetric peer pointers and all communication resources.
+        context->check_available();
+        static_cast<layout::EPSignals*>(context->workspace)->reset();
+        context->clear_error_status();
+    }
+
     void destroy() override {
         EP_HOST_ASSERT(not destroyed);
-        comm::barrier(*context, true);
+        comm::barrier(*context, true, true, false, true);
         ACL_CHECK(aclrtHostUnregister(host_workspace));
         ACL_CHECK(aclrtFreeHost(host_workspace));
         context->finalize();
@@ -72,17 +82,172 @@ public:
         destroyed = true;
     }
 
-    EventHandle lb_prefetch_weights(const std::vector<torch::Tensor>& redundant_expert_weights,
-                                    const std::vector<torch::Tensor>& expert_weights,
-                                    const torch::Tensor& redundancy_mapping, const int& num_sms,
-                                    const std::optional<EventHandle>& previous_event) const {
-        EP_HOST_UNREACHABLE("EPBuffer::lb_prefetch_weights is not implemented on Ascend");
+    void resize(const int64_t& num_buffer_bytes, const int64_t& num_lb_buffer_bytes) {
+        EP_HOST_ASSERT(not destroyed);
+        EP_HOST_ASSERT(num_buffer_bytes > 0 and num_buffer_bytes % kNumAllocationAlignmentBytes == 0);
+        EP_HOST_ASSERT(num_lb_buffer_bytes >= 0 and num_lb_buffer_bytes % kNumAllocationAlignmentBytes == 0);
+        context->resize(num_buffer_bytes + num_lb_buffer_bytes, 0,
+            {this->num_buffer_bytes, this->num_lb_buffer_bytes},
+            {num_buffer_bytes, num_lb_buffer_bytes});
+        this->num_buffer_bytes = num_buffer_bytes;
+        this->num_lb_buffer_bytes = num_lb_buffer_bytes;
+        auto& workspace = *static_cast<layout::EPSignals*>(context->workspace);
+        context->set_barrier_signals(&workspace.barrier_signals);
+        lb_storage = torch::from_blob(
+            context->buffer, {num_buffer_bytes + num_lb_buffer_bytes}, [context = context](void*) {},
+            torch::TensorOptions().dtype(torch::kByte).device(TORCH_DEVICE_NPU)
+        ).narrow(0, num_buffer_bytes, num_lb_buffer_bytes);
     }
 
-    EventHandle lb_reduce_grads(const torch::Tensor& redundant_expert_grads,
-                                const torch::Tensor& expert_grads, const torch::Tensor& redundancy_mapping,
-                                const int& num_sms, const std::optional<EventHandle>& previous_event) const {
-        EP_HOST_UNREACHABLE("EPBuffer::lb_reduce_grads is not implemented on Ascend");
+    pybind11::tuple lb_get_redundancy_mapping(const torch::Tensor& topk_idx, const int& num_experts,
+                                              const int& num_redundant_experts_per_rank, const int& token_alignment, const int& num_sms) const {
+        // Checks
+        EP_HOST_ASSERT(not destroyed);
+        EP_HOST_ASSERT(topk_idx.device().type() == TORCH_DEVICE_NPU and topk_idx.is_contiguous() and topk_idx.dim() == 2);
+        EP_HOST_ASSERT(topk_idx.device() == lb_storage.device());
+        EP_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt64);
+        EP_HOST_ASSERT(num_experts > 0 and num_experts <= kNumMaxExperts and num_experts % context->num_ranks == 0);
+        EP_HOST_ASSERT(token_alignment > 0);
+        EP_HOST_ASSERT(num_sms >= 0 and num_sms <= runtime->get_num_aicore_cores());
+        const int num_main_experts_per_rank = num_experts / context->num_ranks;
+        EP_HOST_ASSERT(num_redundant_experts_per_rank >= 0 and num_redundant_experts_per_rank <= num_main_experts_per_rank);
+        EP_HOST_ASSERT(context->hcomm_context->num_scaleup_ranks == context->num_ranks);
+        EP_HOST_ASSERT(topk_idx.numel() <= layout::LBPrepareSignals::kNumMaxPrepareRoutes);
+        const int num_routes = static_cast<int>(topk_idx.numel());
+        const int num_used_sms = num_sms == 0 ? runtime->get_num_aicore_cores() : num_sms;
+        const int num_vec_cores = num_used_sms * runtime->get_num_vec_cores_per_ai_core();
+        EP_HOST_ASSERT(static_cast<int64_t>(num_experts) * context->num_ranks <= layout::LBPrepareSignals::kNumMaxPrepareRoutes);
+
+        // Allocate and launch on the current stream
+        const auto stream = c10_npu::getCurrentNPUStream();
+        const auto options = topk_idx.options().dtype(torch::kInt);
+        const auto redundancy_mapping = torch::empty(
+            {context->hcomm_context->num_scaleup_ranks, num_redundant_experts_per_rank}, options);
+        const auto remapped_topk_idx = torch::empty_like(topk_idx);
+        launch_lb_get_redundancy_mapping(*context, topk_idx, redundancy_mapping, remapped_topk_idx, num_experts, num_routes,
+                                         token_alignment, num_vec_cores, num_redundant_experts_per_rank, stream);
+        return pybind11::make_tuple(remapped_topk_idx, redundancy_mapping);
+    }
+
+    pybind11::tuple lb_prefetch_weights(const std::vector<torch::Tensor>& redundant_expert_weights,
+                                        const std::vector<torch::Tensor>& expert_weights,
+                                        const torch::Tensor& redundancy_mapping, const int& num_sms,
+                                        const std::optional<EventHandle>& previous_event) const {
+        // Checks
+        EP_HOST_ASSERT(not destroyed);
+        EP_HOST_ASSERT(num_sms > 0 and num_sms <= runtime->get_num_aicore_cores());
+        EP_HOST_ASSERT(redundant_expert_weights.size() == expert_weights.size());
+        EP_HOST_ASSERT(not expert_weights.empty());
+        EP_HOST_ASSERT(redundant_expert_weights.size() <= layout::kNumMaxWeightEntries);
+        EP_HOST_ASSERT(context->hcomm_context->num_scaleup_ranks == context->num_ranks);
+        EP_HOST_ASSERT(redundancy_mapping.device().type() == TORCH_DEVICE_NPU and redundancy_mapping.is_contiguous());
+        EP_HOST_ASSERT(redundancy_mapping.dim() == 2);
+        EP_HOST_ASSERT(redundancy_mapping.size(0) == context->hcomm_context->num_scaleup_ranks);
+        EP_HOST_ASSERT(redundancy_mapping.scalar_type() == torch::kInt);
+        EP_HOST_ASSERT(redundancy_mapping.device() == lb_storage.device());
+
+        const int num_redundant_experts_per_rank = redundancy_mapping.size(1);
+        const int num_weights = static_cast<int>(expert_weights.size());
+        EP_HOST_ASSERT(expert_weights.front().dim() >= 1);
+        const int num_local_experts = expert_weights.front().size(0);
+        EP_HOST_ASSERT(num_local_experts > 0);
+
+        layout::EPWeightList weights;
+        for (int i = 0; i < num_weights; ++ i) {
+            const auto& redundant_expert_weight = redundant_expert_weights[i];
+            const auto& expert_weight = expert_weights[i];
+            EP_HOST_ASSERT(redundant_expert_weight.device().type() == TORCH_DEVICE_NPU and redundant_expert_weight.is_contiguous());
+            EP_HOST_ASSERT(expert_weight.device().type() == TORCH_DEVICE_NPU and expert_weight.is_contiguous());
+            EP_HOST_ASSERT(redundant_expert_weight.dim() >= 1);
+            EP_HOST_ASSERT(expert_weight.dim() >= 1);
+            EP_HOST_ASSERT(redundant_expert_weight.size(0) == num_redundant_experts_per_rank);
+            EP_HOST_ASSERT(expert_weight.size(0) == num_local_experts);
+            const int64_t num_bytes_per_expert = c10::multiply_integers(redundant_expert_weight.sizes().slice(1)) *
+                                                  redundant_expert_weight.element_size();
+            EP_HOST_ASSERT(num_bytes_per_expert == c10::multiply_integers(expert_weight.sizes().slice(1)) *
+                                                   expert_weight.element_size());
+
+            EP_HOST_ASSERT(num_bytes_per_expert % kNumTMAAlignmentBytes == 0);
+            EP_HOST_ASSERT(expert_weight.device() == lb_storage.device());
+            EP_HOST_ASSERT(redundant_expert_weight.device() == lb_storage.device());
+            if (redundant_expert_weight.nbytes() > 0) {
+                const auto begin = reinterpret_cast<uintptr_t>(lb_storage.data_ptr());
+                const auto ptr = reinterpret_cast<uintptr_t>(redundant_expert_weight.data_ptr());
+                EP_HOST_ASSERT(ptr >= begin and ptr - begin <= lb_storage.nbytes());
+                EP_HOST_ASSERT(redundant_expert_weight.nbytes() <= lb_storage.nbytes() - (ptr - begin));
+            }
+
+            weights[i] = {
+                .redundant_expert_weights = redundant_expert_weight.data_ptr(),
+                .expert_weights = expert_weight.data_ptr(),
+                .num_bytes_per_expert = num_bytes_per_expert
+            };
+        }
+
+        // Launch
+        const auto num_used_vec_cores = num_sms * runtime->get_num_vec_cores_per_ai_core();
+        launch_lb_prefetch_weights(
+            context->workspace, context->hcomm_context->device_context,
+            context->rank_idx, context->num_ranks, num_weights, weights, redundancy_mapping.data_ptr<int>(),
+            num_redundant_experts_per_rank, num_local_experts, num_used_vec_cores, static_cast<int>(runtime->get_num_ubuf_bytes_per_vec_core()),
+            context->num_gpu_timeout_cycles);
+
+        std::function<void()> epilogue = [context = context]() {
+            comm::barrier(*context, false, true, false);
+        };
+        return pybind11::make_tuple(EventHandle(), epilogue);
+    }
+
+    pybind11::tuple lb_reduce_grads(const torch::Tensor& redundant_expert_grads,
+                                    const torch::Tensor& expert_grads, const torch::Tensor& redundancy_mapping,
+                                    const int& num_sms, const std::optional<EventHandle>& previous_event) const {
+        // Checks
+        EP_HOST_ASSERT(not destroyed);
+        EP_HOST_ASSERT(num_sms > 0 and num_sms <= runtime->get_num_aicore_cores());
+        EP_HOST_ASSERT(redundant_expert_grads.device().type() == TORCH_DEVICE_NPU and redundant_expert_grads.is_contiguous());
+        EP_HOST_ASSERT(expert_grads.device().type() == TORCH_DEVICE_NPU and expert_grads.is_contiguous());
+        EP_HOST_ASSERT(redundancy_mapping.device().type() == TORCH_DEVICE_NPU and redundancy_mapping.is_contiguous());
+        EP_HOST_ASSERT(context->hcomm_context->num_scaleup_ranks == context->num_ranks);
+        EP_HOST_ASSERT(redundant_expert_grads.dim() == 2);
+        EP_HOST_ASSERT(expert_grads.dim() == 2);
+        EP_HOST_ASSERT(redundancy_mapping.dim() == 2);
+        EP_HOST_ASSERT(redundancy_mapping.size(0) == context->hcomm_context->num_scaleup_ranks);
+        EP_HOST_ASSERT(redundancy_mapping.scalar_type() == torch::kInt);
+
+        const int num_redundant_experts_per_rank = redundancy_mapping.size(1);
+        const int num_local_experts = expert_grads.size(0);
+        const int64_t hidden = expert_grads.size(1);
+
+        EP_HOST_ASSERT(redundant_expert_grads.size(0) == num_redundant_experts_per_rank);
+        EP_HOST_ASSERT(redundant_expert_grads.size(1) == hidden);
+        EP_HOST_ASSERT(redundant_expert_grads.scalar_type() == torch::kFloat);
+        EP_HOST_ASSERT(expert_grads.scalar_type() == torch::kFloat);
+        EP_HOST_ASSERT(num_local_experts > 0);
+        EP_HOST_ASSERT(expert_grads.device() == lb_storage.device());
+        EP_HOST_ASSERT(redundant_expert_grads.device() == lb_storage.device());
+        EP_HOST_ASSERT(redundancy_mapping.device() == lb_storage.device());
+        if (redundant_expert_grads.nbytes() > 0) {
+            const auto begin = reinterpret_cast<uintptr_t>(lb_storage.data_ptr());
+            const auto ptr = reinterpret_cast<uintptr_t>(redundant_expert_grads.data_ptr());
+            EP_HOST_ASSERT(ptr >= begin and ptr - begin <= lb_storage.nbytes());
+            EP_HOST_ASSERT(redundant_expert_grads.nbytes() <= lb_storage.nbytes() - (ptr - begin));
+        }
+
+        const auto num_ub_bytes = static_cast<int>(runtime->get_num_ubuf_bytes_per_vec_core());
+        EP_HOST_ASSERT(num_ub_bytes > 0);
+
+        // Launch: accumulate peers' redundant gradients into the local expert gradients
+        const auto num_used_vec_cores = num_sms * runtime->get_num_vec_cores_per_ai_core();
+        launch_lb_reduce_grads(
+            context->workspace, context->hcomm_context->device_context,
+            context->rank_idx, context->num_ranks, redundant_expert_grads.data_ptr<float>(), expert_grads.data_ptr<float>(),
+            redundancy_mapping.data_ptr<int>(), num_redundant_experts_per_rank, num_local_experts, hidden,
+            num_used_vec_cores, num_ub_bytes, context->num_gpu_timeout_cycles);
+
+        std::function<void()> epilogue = [context = context]() {
+            comm::barrier(*context, false, true, false);
+        };
+        return pybind11::make_tuple(EventHandle(), epilogue);
     }
 
     pybind11::tuple
@@ -111,6 +276,8 @@ public:
              const bool& use_cube_aligned_col_major_sf,
              const bool& defer_epilogue) const {
         EP_HOST_ASSERT(not destroyed);
+        EP_HOST_ASSERT(context->hcomm_context->num_scaleout_ranks == 1 and
+                       "hybrid EP dispatch is not implemented");
 
         // Ascend EP has some limitations over NVIDIA version
         EP_HOST_ASSERT(do_expand);
@@ -265,7 +432,7 @@ public:
                         dst_buffer_slot_idx.data_ptr<int>(),
                         dst_gsge_idx.data_ptr<int>(),
                         context->buffer, context->workspace, mapped_host_workspace,
-                        context->hccl_context->jetty_device_ptrs,
+                        context->hcomm_context->device_context,
                         context->rank_idx, context->num_ranks,
                         num_tokens, num_max_tokens_per_rank,
                         num_experts, num_topk,
@@ -353,7 +520,7 @@ public:
             launch_dispatch_copy_epilogue(
                 context->buffer,
                 context->workspace,
-                context->hccl_context->jetty_device_ptrs,
+                context->hcomm_context->device_context,
                 psum_num_recv_tokens_per_rank.data_ptr<int>(),
                 psum_num_recv_tokens_per_expert.data_ptr<int>(),
                 recv_x.data_ptr(),
@@ -422,8 +589,11 @@ public:
             const std::optional<EventHandle>& previous_event,
             const bool& async_with_compute_stream,
             const bool& allocate_on_comm_stream,
-            const bool& defer_epilogue) const {
+            const bool& defer_epilogue,
+            const bool& use_fp32_output) const {
         EP_HOST_ASSERT(not destroyed);
+        EP_HOST_ASSERT(context->hcomm_context->num_scaleout_ranks == 1 and
+                       "hybrid EP combine is not implemented");
         EP_HOST_ASSERT(num_experts % context->num_ranks == 0);
 
         // Check data tensor
@@ -495,7 +665,7 @@ public:
             context->buffer,
             send_buffer.data_ptr(),
             context->workspace,
-            context->hccl_context->jetty_device_ptrs,
+            context->hcomm_context->device_context,
             context->rank_idx, context->num_ranks,
             num_max_tokens_per_rank,
             num_topk,
@@ -510,7 +680,8 @@ public:
         // No NPU stream tracks that traffic; capture its sources until the epilogue queues the drain.
         auto epilogue = [=, x = x, send_buffer = send_buffer, context = context]() {
             // Allocate output tensors
-            auto combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
+            auto combined_x = torch::empty(
+                {num_combined_tokens, hidden}, x.options().dtype(use_fp32_output ? torch::kFloat : torch::kBFloat16));
             auto combined_topk_weights = std::optional<torch::Tensor>();
             float* combined_topk_weights_ptr = nullptr;
             if (topk_weights.has_value()) {
@@ -527,8 +698,8 @@ public:
                 bias_0.has_value() ? bias_0->data_ptr() : nullptr,
                 bias_1.has_value() ? bias_1->data_ptr() : nullptr,
                 context->workspace,
-                context->hccl_context->jetty_device_ptrs,
-                context->num_ranks,
+                context->hcomm_context->device_context,
+                context->rank_idx, context->num_ranks,
                 num_combined_tokens,
                 num_max_tokens_per_rank,
                 num_experts, num_topk,
@@ -536,6 +707,7 @@ public:
                 num_ub_bytes,
                 num_used_vec_cores,
                 context->num_gpu_timeout_cycles,
+                use_fp32_output,
                 not barrier_in_prologue
             );
 

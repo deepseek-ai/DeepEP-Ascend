@@ -18,11 +18,11 @@ namespace deep_ep {
 
 static void launch_engram_fetch(void* storage, void* fetched,
                                 int* indices, void* workspace,
-                                void* sf, void* fetched_sf,
+                                void* device_context, void* sf, void* fetched_sf,
                                 const int64_t& sf_token_stride, const int64_t& sf_hidden_stride,
                                 const int64_t& sf_layer_stride,
                                 const std::vector<int>& num_entries_per_layer,
-                                const int& num_ranks, const int& num_hidden_bytes,
+                                const int& rank_idx, const int& num_scaleup_ranks, const int& num_hidden_bytes,
                                 const int& num_sf_packs, const int& num_entries_per_token,
                                 const int& num_tokens, const int& num_max_tokens,
                                 const int& num_ub_bytes, const int& num_vec_cores) {
@@ -47,7 +47,7 @@ using namespace deep_ep;
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&engram_fetch_impl<{}, {}, {}, {}, {}, {}, {}, {}>);
 }}
-)", num_ranks, num_hidden_bytes, num_sf_packs,
+)", num_scaleup_ranks, num_hidden_bytes, num_sf_packs,
         num_entries_per_token, num_max_tokens, num_vec_cores,
         num_mte_stages, deep_jit::str::join(num_entries_per_layer_strings, ", ")));
 
@@ -55,9 +55,10 @@ static void __instantiate_kernel() {{
     jit->launch(
         kernel, {.num_blocks = num_vec_cores, .num_ubuf_bytes = num_ub_bytes},
         storage, fetched, indices, workspace,
+        device_context,
         static_cast<sf_pack_t*>(sf), static_cast<sf_pack_t*>(fetched_sf),
         sf_token_stride, sf_hidden_stride, sf_layer_stride,
-        num_tokens);
+        num_tokens, rank_idx);
 }
 
 }  // namespace deep_ep

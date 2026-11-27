@@ -1,5 +1,7 @@
 #pragma once
 
+#include <torch_npu/csrc/core/npu/NPUGraphsUtils.h>
+
 #include "../utils/event.hpp"
 
 namespace deep_ep::comm {
@@ -24,6 +26,10 @@ static void stream_wait(const c10_npu::NPUStream& stream, const c10_npu::NPUStre
 
 static void stream_wait(const c10_npu::NPUStream& stream, const EventHandle& event) {
     event.event->block(stream);
+}
+
+static bool is_stream_capturing(const c10_npu::NPUStream& stream) {
+    return c10_npu::isStreamCapturingMayInitCtx(stream.stream());
 }
 
 }  // namespace deep_ep::comm

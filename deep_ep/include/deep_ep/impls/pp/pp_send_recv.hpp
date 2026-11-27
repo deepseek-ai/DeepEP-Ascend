@@ -6,6 +6,7 @@
 #include <deep_ep/common/math.hpp>
 #include <deep_ep/common/utils.hpp>
 #include <deep_ep/layout/pp/workspace.hpp>
+#include <deep_ep/layout/common/context.hpp>
 
 #include <kernel_operator.h>
 
@@ -22,12 +23,14 @@ __aicore__ void get_buffer_offset(
 #if defined(EP_PP_SEND) or defined(__CLION_IDE__)
 template <int64_t kNumTimeoutCycles>
 __global__ __vector__ void pp_send_impl(__gm__ void* x, const int64_t num_x_bytes,
-                                      __gm__ void* buffer, __gm__ void* workspace, __gm__ void* jetty_ptrs,
+                                      __gm__ void* buffer, __gm__ void* workspace, __gm__ void* device_context_ptr,
                                       const int rank_idx, const int dst_rank_idx, const int num_ranks,
                                       const int64_t num_max_tensor_bytes, const int num_max_inflight_tensors) {
     AscendC::InitSocState();
 
     auto& pp = *static_cast<__gm__ layout::PPSignals*>(workspace);
+    auto* device_context = static_cast<__gm__ layout::DeviceContext*>(device_context_ptr);
+    const auto error_status = layout::DeviceContext::get_error_status(*device_context);
 
     // Block index
     const auto block_idx = static_cast<int>(AscendC::GetBlockIdx());
@@ -61,7 +64,7 @@ __global__ __vector__ void pp_send_impl(__gm__ void* x, const int64_t num_x_byte
                                 rank_idx, dst_rank_idx, credit, credit_target);
             }
             return false;
-        });
+        }, 0, error_status);
     }
     AscendC::SyncAll<true>();
 
@@ -73,12 +76,12 @@ __global__ __vector__ void pp_send_impl(__gm__ void* x, const int64_t num_x_byte
             dst_rank_idx < rank_idx ? dst_rank_idx : dst_rank_idx - 1;
         __ubuf__ uint64_t ub_peer_info[sizeof(handle::HcommPeerInfo) / sizeof(uint64_t)];
         const auto peer_info = reinterpret_cast<__ubuf__ handle::HcommPeerInfo*>(ub_peer_info);
-        const handle::HcommPeer peer(peer_info, jetty_ptrs, dst_jetty_idx);
+        const handle::HcommPeer peer(peer_info, device_context->scaleup_jetties, dst_jetty_idx);
         alignas(8) __ubuf__ uint8_t ub_jetty_info[sizeof(handle::HcommJettyInfo)];
         alignas(kNumUbAlignmentBytes) __ubuf__ uint8_t ub_sqe[handle::HcommJetty::kNumMaxSQEBytes];
         handle::HcommJetty hcomm(
             reinterpret_cast<__ubuf__ handle::HcommJettyInfo*>(ub_jetty_info), ub_sqe,
-            jetty_ptrs, dst_jetty_idx);
+            device_context->scaleup_jetties, dst_jetty_idx, error_status);
 
         // Issue
         hcomm.template put_with_notify<kNumTimeoutCycles>(
@@ -94,12 +97,14 @@ __global__ __vector__ void pp_send_impl(__gm__ void* x, const int64_t num_x_byte
 template <int64_t kNumTimeoutCycles>
 __global__ __vector__ void pp_recv_impl(__gm__ void* x, const int64_t num_x_bytes,
                                         __gm__ void* buffer, __gm__ void* workspace,
-                                        __gm__ void* jetty_ptrs,
+                                        __gm__ void* device_context_ptr,
                                         const int rank_idx, const int src_rank_idx, const int num_ranks,
                                         const int64_t num_max_tensor_bytes, const int num_max_inflight_tensors) {
     AscendC::InitSocState();
 
     auto& pp = *static_cast<__gm__ layout::PPSignals*>(workspace);
+    auto* device_context = static_cast<__gm__ layout::DeviceContext*>(device_context_ptr);
+    const auto error_status = layout::DeviceContext::get_error_status(*device_context);
 
     // Block indices
     const auto block_idx = static_cast<int>(AscendC::GetBlockIdx());
@@ -133,7 +138,7 @@ __global__ __vector__ void pp_recv_impl(__gm__ void* x, const int64_t num_x_byte
                                 rank_idx, src_rank_idx, data, data_target);
             }
             return false;
-        });
+        }, 0, error_status);
     }
     AscendC::SyncAll<true>();
 
@@ -147,12 +152,12 @@ __global__ __vector__ void pp_recv_impl(__gm__ void* x, const int64_t num_x_byte
             src_rank_idx < rank_idx ? src_rank_idx : src_rank_idx - 1;
         __ubuf__ uint64_t ub_peer_info[sizeof(handle::HcommPeerInfo) / sizeof(uint64_t)];
         const auto peer_info = reinterpret_cast<__ubuf__ handle::HcommPeerInfo*>(ub_peer_info);
-        const handle::HcommPeer peer(peer_info, jetty_ptrs, src_jetty_idx);
+        const handle::HcommPeer peer(peer_info, device_context->scaleup_jetties, src_jetty_idx);
         alignas(8) __ubuf__ uint8_t ub_jetty_info[sizeof(handle::HcommJettyInfo)];
         alignas(kNumUbAlignmentBytes) __ubuf__ uint8_t ub_sqe[handle::HcommJetty::kNumMaxSQEBytes];
         handle::HcommJetty hcomm(
             reinterpret_cast<__ubuf__ handle::HcommJettyInfo*>(ub_jetty_info), ub_sqe,
-            jetty_ptrs, src_jetty_idx);
+            device_context->scaleup_jetties, src_jetty_idx, error_status);
 
         AscendC::WriteGmByPassDCache(recv_count_ptr, recv_count + 1);
         AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
