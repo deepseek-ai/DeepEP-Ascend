@@ -18,6 +18,7 @@ __all__ = [
     'KernelProfile',
     'bench_msprof',
     'bench',
+    'flush_l2_cache',
     'parse_num_bytes',
 ]
 
@@ -48,6 +49,37 @@ def bench(fn: Callable, num_warmups: int = 30, num_tests: int = 30,
     torch.npu.synchronize()
     times = [start.elapsed_time(end) / 1000 for start, end in zip(start_events, end_events, strict=True)]
     return sum(times) / len(times), min(times), max(times)
+
+
+def generate_lognormal_topk(num_tokens: int, num_experts: int, num_topk: int, rank_idx: int,
+                            seed: int = 0, sigma: float = 0.9, device: str = 'npu') -> torch.Tensor:
+    """Draw rank-specific routes without replacement from shared lognormal expert popularities.
+
+    `sigma` is the popularity spread of the routing load the planner targets. Popularities come from
+    `seed` and the routes from `seed + SEED_STRIDE * rank_idx`, so every rank shares the popularities
+    but draws its own tokens.
+    """
+    # Routes of consecutive ranks are drawn from generators this far apart
+    SEED_STRIDE = 1000
+    # Draw in chunks, so the Gumbel noise of a long token list never has to exist at once
+    TOKENS_PER_DRAW_CHUNK = 4096
+    # `log(0)` is -inf, so the uniform draw the noise is built from is clamped away from zero
+    MIN_UNIFORM = 1e-20
+
+    generator = torch.Generator(device='cpu').manual_seed(seed)
+    popularity = (sigma * torch.randn(num_experts, generator=generator, dtype=torch.float64,
+                                     device='cpu')).exp()
+    logits = popularity.log()
+    generator = torch.Generator(device='cpu').manual_seed(seed + SEED_STRIDE * rank_idx)
+    topk_idx = torch.empty(num_tokens, num_topk, dtype=torch.int64, device='cpu')
+    for start in range(0, num_tokens, TOKENS_PER_DRAW_CHUNK):
+        end = min(start + TOKENS_PER_DRAW_CHUNK, num_tokens)
+        # `-log(-log(U))` is standard Gumbel noise, the same draw `numpy.random.gumbel` makes
+        uniform = torch.rand(end - start, num_experts, generator=generator, dtype=torch.float64,
+                             device='cpu').clamp_min(MIN_UNIFORM)
+        gumbel = -torch.log(-torch.log(uniform))
+        topk_idx[start:end] = (logits.unsqueeze(0) + gumbel).topk(num_topk, dim=1).indices
+    return topk_idx.to(device)
 
 
 def parse_num_bytes(text: str) -> int:
@@ -282,6 +314,25 @@ def _parse_ffts_profile(prof_path: Path) -> dict[str, KernelProfile]:
     return result
 
 
+_aclrt_device_l2_cache_flush = None
+
+
+def flush_l2_cache() -> None:
+    """Synchronize the current NPU device and flush its L2 cache."""
+    global _aclrt_device_l2_cache_flush
+    if _aclrt_device_l2_cache_flush is None:
+        ascendcl = ctypes.CDLL('libascendcl.so', mode=ctypes.RTLD_GLOBAL)
+        fn = ascendcl.aclrtDeviceL2CacheFlush
+        fn.argtypes = [ctypes.c_void_p]
+        fn.restype = ctypes.c_int
+        _aclrt_device_l2_cache_flush = fn
+    # aclrtDeviceL2CacheFlush is host-synchronous and does not wait for queued stream work.
+    torch.npu.synchronize()
+    ret = _aclrt_device_l2_cache_flush(None)
+    if ret != 0:
+        raise RuntimeError(f'aclrtDeviceL2CacheFlush failed with {ret}')
+
+
 def _device_busy() -> None:
     """
     Keep the device busy by enqueuing a large dummy matmul on the current stream.
@@ -335,7 +386,6 @@ def bench_msprof(
     if barrier is not None:
         barrier()
 
-    flush_l2_size = int(8e9 // 4)
     barrier_comm_profiling &= int(os.environ.get('EP_DISABLE_BARRIER_PROFILING', 0)) == 0
     dummy = torch.ones(1, dtype=torch.float, device='npu') if barrier_comm_profiling and barrier is None else None
 
@@ -358,7 +408,7 @@ def bench_msprof(
             ) as prof:
                 for _ in range(num_tests):
                     if flush_l2:
-                        torch.empty(flush_l2_size, dtype=torch.int, device='npu').zero_()
+                        flush_l2_cache()
                     if barrier_comm_profiling:
                         _device_busy()
                         if barrier is None:

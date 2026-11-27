@@ -76,10 +76,9 @@ class EngramBuffer(BufferBase):
         self.allow_hybrid_mode = allow_hybrid_mode
         self.num_allocated_qps = 0
 
-        self.hccl_comm_handle = comm.get_hccl_comm_handle(group)
         super().__init__(explicitly_destroy)
         self.runtime = _C.EngramBuffer(
-            self.rank_idx, self.num_ranks, self.hccl_comm_handle.get(),
+            self.rank_idx, self.num_ranks, group,
             num_gpu_bytes, num_rdma_storage_bytes, use_huge1g_page,
             num_gpu_timeout_secs, explicitly_destroy)
         self.context = self.runtime.context
@@ -94,7 +93,6 @@ class EngramBuffer(BufferBase):
     def destroy(self) -> None:
         super().destroy()
         self.context = None
-        self.hccl_comm_handle = None
 
     @staticmethod
     def get_storage_size_hint(group: dist.ProcessGroup,

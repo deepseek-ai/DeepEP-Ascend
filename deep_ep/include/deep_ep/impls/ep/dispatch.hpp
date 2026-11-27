@@ -8,6 +8,7 @@
 #include <c_api/vector_datamove/vector_datamove.h>
 
 #include <deep_ep/comm/barrier.hpp>
+#include <deep_ep/layout/common/context.hpp>
 #include <deep_ep/common/compiled.hpp>
 #include <deep_ep/comm/handle.hpp>
 #include <deep_ep/layout/ep/token.hpp>
@@ -85,7 +86,7 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
     const layout::EPWorkspaceLayout workspace_layout, const layout::EPWorkspaceLayout host_workspace_layout,
     __ubuf__ ub_layout_t* ub_layout,
     __gm__ const uint8_t* x, __gm__ const uint8_t* metadata_send_buffer,
-    __gm__ const uint64_t* jetty_ptrs,
+    __gm__ const layout::DeviceContext* device_context,
     __gm__ const int64_t* topk_idx,
     __gm__ int* cumulative_local_expert_recv_stats,
     __gm__ int* psum_num_recv_tokens_per_rank,
@@ -94,6 +95,7 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
     const uint64_t recv_buffer_offset,
     const int num_hidden_bytes, const int num_metadata_bytes, const int num_token_bytes,
     const int num_tokens, const int vec_core_idx, const int rank_idx) {
+    const auto error_status = layout::DeviceContext::get_error_status(*device_context);
     // Indices
     // TODO: try intrinsics
     // TODO: reshuffling, but also ensure coalescing
@@ -297,24 +299,25 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
 
     // Load descriptors while the scalar pipeline copies local payloads.
     if (thread_idx < kNumRanks and thread_idx != rank_idx)
-        handle::HcommPeerInfo::load_peer_info(ub_layout->peer_info + thread_idx, jetty_ptrs,
-                              thread_idx < rank_idx ? thread_idx : thread_idx - 1);
+        handle::HcommPeerInfo::load_peer_info(ub_layout->peer_info + thread_idx, device_context->scaleup_jetties,
+                              thread_idx < rank_idx ? thread_idx : thread_idx - 1, error_status);
     if (warp_idx == 1 and kNumRanks > 1) {
-        handle::HcommJettyInfo::load_jetty_info(&ub_layout->jetty_info, jetty_ptrs, vec_core_idx, lane_idx);
+        handle::HcommJettyInfo::load_jetty_info(&ub_layout->jetty_info, device_context->scaleup_jetties, vec_core_idx,
+                                                lane_idx, error_status);
         // Check SQ capacity before releasing other warps to write WQEBBs.
         if (lane_idx == 0 and static_cast<uint64_t>(ub_layout->lsqe_counter) * kNumWQEBBsPerSQESlot > handle::kSQDepth)
-            __asc_simt_vf::__trap();
+            record_error_and_trap_simt(error_status, layout::kSQCapacityExceeded);
     }
     asc_syncthreads();
     if (thread_idx == 0 and kNumRanks > 1 and
         static_cast<uint32_t>(ub_layout->jetty_info.packed_head) % kSQEBBAlignment != 0)
-        __asc_simt_vf::__trap();
+        record_error_and_trap_simt(error_status, layout::kSQAlignmentError);
 
     if constexpr (not kCachedMode) {
         // scatter rank counts to remote ranks
         for (int peer_idx = vec_core_idx + thread_idx * kNumVecCores; peer_idx < kNumRanks; peer_idx += kNumVecCores * kNumThreads) {
             auto ptr = layout::get_sym_ptr(
-                workspace_layout.get_common_signals(),
+                workspace_layout.get_barrier_signals(), *device_context,
                 workspace_layout.get_remote_rank_histogram_ptr(rank_idx),
                 peer_idx
             );
@@ -436,7 +439,7 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
             const auto token_idx = vec_core_idx * kNumMaxTokensPerVecCore + i;
             const auto src = reinterpret_cast<__gm__ const uint64_t*>(metadata_send_buffer + static_cast<int64_t>(token_idx) * num_metadata_bytes);
             const auto dst = reinterpret_cast<__gm__ uint64_t*>(
-                reinterpret_cast<uint64_t>(&workspace_layout.get_common_signals()) + recv_buffer_offset +
+                reinterpret_cast<uint64_t>(&workspace_layout.get_barrier_signals()) + recv_buffer_offset +
                 static_cast<uint64_t>(dst_slot_idx) * num_token_bytes + num_hidden_bytes);
             for (int word_idx = lane_idx; word_idx < num_metadata_bytes / sizeof(uint64_t); word_idx += warpSize)
                 asc_stcg(dst + word_idx, src[word_idx]);
@@ -456,7 +459,7 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
         const auto num_local_tokens = reduction::get_reduction_value(status);
         const auto dst_expert_idx = thread_idx - dst_rank_idx * kNumExpertsPerRank;
         asc_atomic_add(
-            layout::get_sym_ptr(workspace_layout.get_common_signals(),
+            layout::get_sym_ptr(workspace_layout.get_barrier_signals(), *device_context,
                                 workspace_layout.get_remote_expert_histogram_ptr(dst_expert_idx), dst_rank_idx),
             reduction::kReductionIdentity | num_local_tokens
         );
@@ -468,7 +471,8 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
     // Expert reduction: wait for all ranks' arrival
     if (vec_core_idx == 0 and thread_idx < kNumExpertsPerRank) {
         const auto status = reduction::simt::wait_ready<kNumTimeoutCycles>(
-            workspace_layout.get_remote_expert_histogram_ptr(thread_idx), kNumRanks);
+            workspace_layout.get_remote_expert_histogram_ptr(thread_idx), kNumRanks,
+            error_status);
 
         // Record the token count into UB, GM and host buffers
         // TODO: the results to host may be not aligned
@@ -493,7 +497,8 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
         // Wait remote arrival
         ub_layout->rank_psum[thread_idx] = reduction::get_reduction_value(
             reduction::simt::wait_ready<kNumTimeoutCycles>(
-                workspace_layout.get_remote_rank_histogram_ptr(thread_idx), kNumVecCores));
+                workspace_layout.get_remote_rank_histogram_ptr(thread_idx), kNumVecCores,
+                error_status));
 
         // Clean workspace for next usages
         *workspace_layout.get_remote_rank_histogram_ptr(thread_idx) = 0;
@@ -563,17 +568,19 @@ __global__ __vector__ void dispatch_impl(
     __gm__ int* psum_num_recv_tokens_per_expert, __gm__ int* num_unaligned_recv_tokens_per_expert,
     __gm__ int* dst_buffer_slot_idx, __gm__ int* dst_gsge_idx,
     __gm__ void* buffer, __gm__ void* workspace, __gm__ void* host_workspace,
-    __gm__ void* jetty_ptrs,
+    __gm__ void* device_context_ptr,
     const int rank_idx,
     const int num_tokens,
     const int sf_token_stride,
     const int sf_hidden_stride) {
     // TODO(HUAWEI): kernel launch & init SoC cost 1.9 us, which is slow
     AscendC::InitSocState();
+    auto* device_context = static_cast<__gm__ layout::DeviceContext*>(device_context_ptr);
+    const auto error_status = layout::DeviceContext::get_error_status(*device_context);
 
     // Checks
     // NOTES: the one-to-many-rank Jetty is private for this vector core
-    EP_STATIC_ASSERT(kNumRanks <= kNumMaxRanks);
+    EP_STATIC_ASSERT(kNumRanks <= kNumMaxEPRanks);
     EP_STATIC_ASSERT(kNumExperts % kNumRanks == 0);
     EP_STATIC_ASSERT(math::is_power_of_2(kExpertAlignment));
     EP_STATIC_ASSERT(kNumVecCores > 0);
@@ -602,7 +609,7 @@ __global__ __vector__ void dispatch_impl(
     EP_STATIC_ASSERT(kNumMaxSQEs * kNumWQEBBsPerSQESlot <= static_cast<int64_t>(UINT16_MAX) + 1,
                      "Dispatch WQEBBs exceed the 16-bit SQ index range");
     // TODO: tune the best Jetty count
-    EP_STATIC_ASSERT(kNumJetties == kNumVecCores and kNumJetties <= 64);
+    EP_STATIC_ASSERT(kNumJetties == kNumVecCores and kNumJetties <= kNumMaxVecCores);
     EP_DEVICE_ASSERT(0 <= num_tokens and num_tokens <= kNumMaxTokensPerRank);
     if constexpr (kNumSFPacks > 0)
         EP_DEVICE_ASSERT(sf_token_stride > 0 and sf_hidden_stride > 0);
@@ -646,14 +653,15 @@ __global__ __vector__ void dispatch_impl(
     if (vec_core_idx == 0)
         asc_mark_stamp<PIPE_S>(kTraceBarrierBefore);
 #endif
-    comm::scalar::barrier<kNumRanks, kNumTimeoutCycles, false>(workspace_layout.get_common_signals(), vec_core_idx);
+    comm::scalar::barrier<kNumRanks, kNumRanks, kNumTimeoutCycles, false>(
+        workspace_layout.get_barrier_signals(), *device_context, vec_core_idx, rank_idx);
 #if defined(ASCENDC_TRACE_ON)
     if (vec_core_idx == 0)
         asc_mark_stamp<PIPE_S>(kTraceBarrierAfter);
 #endif
 
     // Do notify, SQE writes and local copy pipeline using a SIMT persistent worker
-    handle::HcommJetty jetty(&ub_layout->jetty_info, nullptr, nullptr, vec_core_idx);
+    handle::HcommJetty jetty(&ub_layout->jetty_info, nullptr, nullptr, vec_core_idx, error_status);
 
     {
         static constexpr int kNumThreads = 512;
@@ -672,7 +680,7 @@ __global__ __vector__ void dispatch_impl(
             dim3(kNumThreads, 1, 1),
             workspace_layout, host_workspace_layout, ub_layout,
             static_cast<__gm__ const uint8_t*>(x), metadata_send_buffer,
-            static_cast<__gm__ const uint64_t*>(jetty_ptrs),
+            device_context,
             topk_idx, cumulative_local_expert_recv_stats,
             psum_num_recv_tokens_per_rank, psum_num_recv_tokens_per_expert, num_unaligned_recv_tokens_per_expert,
             dst_buffer_slot_idx, dst_gsge_idx,
@@ -858,8 +866,8 @@ __global__ __vector__ void dispatch_impl(
     // benchmark only: wait for all urma traffic to measure URMA latency
     if constexpr (kDoBarrier)
         comm::scalar::barrier<
-            kNumRanks, kNumTimeoutCycles, true, true, true, kNumVecCores, kNumJetties>(
-                workspace_layout.get_common_signals(), vec_core_idx, jetty_ptrs);
+            kNumRanks, kNumRanks, kNumTimeoutCycles, true, true, true, kNumVecCores, kNumJetties>(
+                workspace_layout.get_barrier_signals(), *device_context, vec_core_idx, rank_idx);
 }
 
 }  // namespace deep_ep

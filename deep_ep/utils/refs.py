@@ -154,12 +154,14 @@ def generate_pre_combine_data(src_token_global_idx: torch.Tensor,
     return result.to(torch.bfloat16)
 
 
-def ordered_accumulate(data: torch.Tensor, initial_value: Optional[torch.Tensor] = None) -> torch.Tensor:
+def ordered_accumulate(data: torch.Tensor, out_dtype: torch.dtype,
+                       initial_value: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     Accumulate `data` in order along the num_topk dimension.
 
     Arguments:
         data: data to be accumulated, `[num_tokens, num_topk, hidden]`.
+        out_dtype: Output dtype
         initial_value: initial value for accumulation, `[num_tokens, hidden]`.
 
     Returns:
@@ -172,12 +174,12 @@ def ordered_accumulate(data: torch.Tensor, initial_value: Optional[torch.Tensor]
         result = initial_value.clone()
     for i in range(num_topk):
         result += data[:, i, :].float()
-    return result.to(data.dtype)
+    return result.to(out_dtype)
 
 
 def combine(y: torch.Tensor, topk_idx: torch.Tensor, num_experts: int,
             bias: Optional[Union[Tuple[torch.Tensor, ...], torch.Tensor]],
-            reduce_in_local: bool) -> torch.Tensor:
+            reduce_in_local: bool, use_fp32_output: bool = False) -> torch.Tensor:
     """
     The reference implementation of (possibly intra-rank reduced) combining tokens.
 
@@ -189,6 +191,7 @@ def combine(y: torch.Tensor, topk_idx: torch.Tensor, num_experts: int,
         reduce_in_local: whether to do reduction within each rank first.
             - `True`  -> reduce selections landing on the same rank before the global accumulation.
             - `False` -> equivalent to `allow_multiple_reduction` being False.
+        use_fp32_output: Return FP32 instead of BF16.
 
     Returns:
         the combined result, `[num_tokens, hidden]`.
@@ -243,5 +246,5 @@ def combine(y: torch.Tensor, topk_idx: torch.Tensor, num_experts: int,
             bias_sum = bias_tensor.float() if bias_sum is None else bias_sum + bias_tensor.float()
     elif bias is not None:
         bias_sum = bias.float()
-    result = ordered_accumulate(y, bias_sum)
+    result = ordered_accumulate(y, torch.float32 if use_fp32_output else torch.bfloat16, bias_sum)
     return result

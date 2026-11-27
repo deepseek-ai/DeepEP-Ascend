@@ -1,20 +1,35 @@
 #pragma once
 
 #include <deep_ep/common/math.hpp>
-#include <deep_ep/layout/common/signals.hpp>
+#include <deep_ep/layout/barrier.hpp>
+#include <deep_ep/layout/ep/lb.hpp>
 
 namespace deep_ep::layout {
 
 struct alignas(kNumAllocationAlignmentBytes) EPSignals {
-    CommonSignals common_signals;
+    BarrierSignals barrier_signals;
     // Local histogram counters occupy separate sectors.
     int local_expert_histogram[kNumMaxExperts][kNumSectorInts];
     int remote_expert_histogram[kNumMaxExperts];
-    int local_rank_histogram[kNumMaxVecCores][math::align(kNumMaxRanks, kNumSectorInts)];
-    int remote_rank_histogram[kNumMaxRanks];
-    int host_rank_expert_count[kNumMaxRanks + kNumMaxExperts];
+    int local_rank_histogram[kNumMaxVecCores][math::align(kNumMaxEPRanks, kNumSectorInts)];
+    int remote_rank_histogram[kNumMaxEPRanks];
+    int host_rank_expert_count[kNumMaxEPRanks + kNumMaxExperts];
     // Rows are packed with the active number of experts per rank.
     int epilogue_expert_counter[kNumMaxVecCores * kNumMaxExperts];
+    LBPrepareSignals lb_prepare_signals;
+
+#ifdef __HOST_ONLY__
+    void reset() {
+        barrier_signals.reset();
+        lb_prepare_signals.barrier_signals.reset();
+        // Dispatch clears these after consumption, which an abort can skip.
+        // Host notifications and epilogue counters are initialized before use.
+        ACL_CHECK(aclrtMemset(local_expert_histogram, sizeof(local_expert_histogram), 0, sizeof(local_expert_histogram)));
+        ACL_CHECK(aclrtMemset(remote_expert_histogram, sizeof(remote_expert_histogram), 0, sizeof(remote_expert_histogram)));
+        ACL_CHECK(aclrtMemset(local_rank_histogram, sizeof(local_rank_histogram), 0, sizeof(local_rank_histogram)));
+        ACL_CHECK(aclrtMemset(remote_rank_histogram, sizeof(remote_rank_histogram), 0, sizeof(remote_rank_histogram)));
+    }
+#endif
 };
 
 struct EPWorkspaceLayout {
@@ -27,8 +42,8 @@ struct EPWorkspaceLayout {
         return sizeof(EPSignals);
     }
 
-    constexpr __aicore__ __forceinline__ __gm__ CommonSignals& get_common_signals() const {
-        return signals.common_signals;
+    constexpr __aicore__ __forceinline__ __gm__ BarrierSignals& get_barrier_signals() const {
+        return signals.barrier_signals;
     }
 
     constexpr __aicore__ __forceinline__ __gm__ int* get_local_expert_histogram_ptr(const int& expert_idx = 0) const {
@@ -57,7 +72,7 @@ struct EPWorkspaceLayout {
     }
 
     constexpr __aicore__ __forceinline__ volatile __gm__ int* get_host_expert_count_ptr(const int& expert_idx = 0) const {
-        return signals.host_rank_expert_count + kNumMaxRanks + expert_idx;
+        return signals.host_rank_expert_count + kNumMaxEPRanks + expert_idx;
     }
 
     constexpr __aicore__ __forceinline__ __gm__ int* get_epilogue_expert_counter_ptr(

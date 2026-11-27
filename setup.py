@@ -99,7 +99,7 @@ if __name__ == '__main__':
     torch_npu_dir = os.path.dirname(torch_npu.__file__)
     package_dir = Path(current_dir) / 'deep_ep'
 
-    sources = ['csrc/python_api.cpp']
+    sources = ['csrc/python_api.cpp', 'csrc/comm/topology.cpp']
 
     cxx_flags = [
         '-O3', '-g1', '-fPIC', '-std=c++20',
@@ -127,7 +127,7 @@ if __name__ == '__main__':
         f'{torch_npu_dir}/lib',
     ] + torch_library_paths()
 
-    libraries = ['ascendcl', 'hccl', 'hcomm', 'torch_npu']
+    libraries = ['ascendcl', 'hcomm', 'torch_npu', 'topoaddrinfo']
     extra_link_args = [
         f'-Wl,-rpath,{ascend_home}/lib64',
         '-Wl,-Bsymbolic-functions',

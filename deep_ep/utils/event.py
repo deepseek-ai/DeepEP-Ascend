@@ -41,18 +41,15 @@ class EventOverlap:
             result: the return value of the registered hook, or `None` if no hook is registered.
         """
         assert self.event is not None
-        self.event.current_stream_wait()
-
-        # Call epilogue hook
-        result = None
-        if self.hook_after_wait is not None:
-            result = self.hook_after_wait()
-            self.hook_after_wait = None
-
-        # Release event handle
-        if release_handle:
-            self.event = None
-        return result
+        hook = self.hook_after_wait
+        self.hook_after_wait = None
+        try:
+            self.event.current_stream_wait()
+            return hook() if hook is not None else None
+        finally:
+            # Release event handles even when the wait or epilogue reports an error.
+            if release_handle:
+                self.event = None
 
     def wait(self) -> Any:
         """Wait on the current stream and return the registered epilogue result."""

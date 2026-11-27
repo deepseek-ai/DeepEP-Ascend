@@ -1,12 +1,12 @@
 #pragma once
 
-#include <deep_ep/layout/common/signals.hpp>
+#include <deep_ep/layout/barrier.hpp>
 
 namespace deep_ep::layout {
 
 // Pipeline-parallel send/recv state, indexed by the ring direction.
 struct alignas(kNumAllocationAlignmentBytes) PPSignals {
-    CommonSignals common_signals;
+    BarrierSignals barrier_signals;
     int64_t send_count[2];
     int64_t recv_count[2];
     int64_t arrival[2];

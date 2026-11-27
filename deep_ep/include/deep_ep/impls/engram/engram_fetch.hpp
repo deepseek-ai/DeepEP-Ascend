@@ -4,7 +4,8 @@
 
 #include <deep_ep/common/compiled.hpp>
 #include <deep_ep/layout/engram/workspace.hpp>
-#include <deep_ep/common/exception.hpp>
+#include <deep_ep/layout/common/context.hpp>
+#include <deep_ep/common/error.hpp>
 #include <deep_ep/common/math.hpp>
 
 #include <kernel_operator.h>
@@ -12,17 +13,19 @@
 
 namespace deep_ep {
 
-template <int kNumRanks, int kNumHiddenBytes, int kNumSFPacks,
+template <int kNumScaleupRanks, int kNumHiddenBytes, int kNumSFPacks,
           int kNumEntriesPerToken, int kNumMaxTokens, int kNumVecCores,
           int kNumMTEStages, int... kNumEntriesPack>
 __global__ __vector__ void engram_fetch_impl(__gm__ void* storage, __gm__ void* fetched,
                                            __gm__ int* indices, __gm__ void* workspace,
-                                           __gm__ sf_pack_t* sf, __gm__ sf_pack_t* fetched_sf,
+                                           __gm__ void* device_context_ptr, __gm__ sf_pack_t* sf,
+                                           __gm__ sf_pack_t* fetched_sf,
                                            const int64_t sf_token_stride,
                                            const int64_t sf_hidden_stride,
                                            const int64_t sf_layer_stride,
-                                           const int num_tokens) {
+                                           const int num_tokens, const int rank_idx) {
     AscendC::InitSocState();
+    EP_STATIC_ASSERT(kNumScaleupRanks > 0 and kNumScaleupRanks <= kNumMaxScaleupRanks);
     EP_STATIC_ASSERT(kNumMaxTokens > 0 and kNumEntriesPerToken > 0);
     EP_STATIC_ASSERT(static_cast<int64_t>(kNumMaxTokens) * kNumEntriesPerToken +
                          static_cast<int64_t>(math::max(1, kNumMTEStages - 1)) * kNumVecCores <= INT_MAX,
@@ -35,9 +38,11 @@ __global__ __vector__ void engram_fetch_impl(__gm__ void* storage, __gm__ void* 
     constexpr int kNumAlignedHiddenBytes = math::align(kNumHiddenBytes, kNumUbAlignmentBytes);
     constexpr int kNumBytesPerStage = kNumAlignedHiddenBytes + math::align(kNumSFBytes, kNumUbAlignmentBytes);
     const auto vec_core_idx = static_cast<int>(AscendC::GetBlockIdx());
+    auto* device_context = static_cast<__gm__ layout::DeviceContext*>(device_context_ptr);
     auto& engram_workspace = *static_cast<__gm__ layout::EngramWorkspace*>(workspace);
     const auto ub = reinterpret_cast<__ubuf__ uint8_t*>(0);
     const auto num_entries = num_tokens * kNumEntriesPerToken;
+    const auto domain_start = layout::get_scaleup_domain_start_rank<kNumScaleupRanks>(rank_idx);
 
     #pragma unroll
     for (int stage_idx = 0; stage_idx < kNumMTEStages; ++ stage_idx)
@@ -63,20 +68,22 @@ __global__ __vector__ void engram_fetch_impl(__gm__ void* storage, __gm__ void* 
 
             asc_sync_wait(PIPE_MTE3, PIPE_MTE2, static_cast<event_t>(stage_idx));
             if (global_idx >= 0) {
-                const auto src_rank_idx = global_idx / num_entries_per_rank;
+                const auto src_scaleup_rank_idx = global_idx / num_entries_per_rank - domain_start;
+                if (src_scaleup_rank_idx < 0 or src_scaleup_rank_idx >= kNumScaleupRanks)
+                    record_error_and_trap(layout::DeviceContext::get_error_status(*device_context), layout::kInvalidCommMetadata);
                 const auto src_entry_idx = global_idx % num_entries_per_rank;
                 const auto local_entry = math::advance_ptr<__gm__ uint8_t>(
                     layer_storage, static_cast<int64_t>(src_entry_idx) * kNumHiddenBytes);
                 asc_copy_gm2ub_align(
                     ub_entry,
-                    layout::get_sym_ptr(engram_workspace.common_signals, local_entry, src_rank_idx),
+                    layout::get_sym_ptr(engram_workspace.barrier_signals, *device_context, local_entry, src_scaleup_rank_idx),
                     kNumHiddenBytes
                 );
                 if constexpr (kNumSFPacks > 0) {
                     const auto local_sf = sf + (num_prefix_entries + src_entry_idx) * kNumSFPacks;
                     asc_copy_gm2ub_align(
                         math::advance_ptr<__ubuf__ sf_pack_t>(ub_entry, kNumAlignedHiddenBytes),
-                        layout::get_sym_ptr(engram_workspace.common_signals, local_sf, src_rank_idx),
+                        layout::get_sym_ptr(engram_workspace.barrier_signals, *device_context, local_sf, src_scaleup_rank_idx),
                         kNumSFBytes
                     );
                 }

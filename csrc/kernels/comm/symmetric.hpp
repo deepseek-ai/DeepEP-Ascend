@@ -21,7 +21,14 @@ public:
     }
 
     ~SymmetricMemory() noexcept(false) {
-        ACL_CHECK(aclrtFree(ptr));
+        free();
+    }
+
+    void free() {
+        if (ptr != nullptr) {
+            ACL_CHECK(aclrtFree(ptr));
+            ptr = nullptr;
+        }
     }
 
     SymmetricMemory(const SymmetricMemory&) = delete;

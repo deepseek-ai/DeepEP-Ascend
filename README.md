@@ -1,8 +1,8 @@
 # DeepEP-Ascend
 
-**（中文介绍）**[DeepEP-Ascend](https://github.com/deepseek-ai/DeepEP-Ascend) 是面向华为昇腾 NPU 的高性能机器学习训练与推理通信库，提供 MoE dispatch/combine 的专家并行（EP）all-to-all 操作，支持 FP8 dispatch 和延迟 epilogue。此外还提供流水线并行（PP）、面向上下文并行和数据并行（CP/DP）的 Bucket 集合通信，以及 Engram 远端内存访问等通信原语（开发中）。其公开 buffer API 与 NVIDIA 版 [DeepEP](https://github.com/deepseek-ai/DeepEP) 对齐。Ascend C 内核使用 HCCL/HCOMM、UBMEM 和 URMA 完成通信，并通过 [DeepJIT](https://github.com/deepseek-ai/DeepJIT) 在运行时编译。
+**（中文介绍）**[DeepEP-Ascend](https://github.com/deepseek-ai/DeepEP-Ascend) 是面向华为昇腾 NPU 的高性能机器学习训练与推理通信库，提供 MoE dispatch/combine 的专家并行（EP）all-to-all，支持 FP8 dispatch 和延迟 epilogue。此外还提供流水线并行（PP）、面向上下文并行和数据并行（CP/DP）的 Bucket 集合通信，以及 Engram 远端内存访问等通信原语（开发中）。其公开 buffer API 与 NVIDIA 版 [DeepEP](https://github.com/deepseek-ai/DeepEP) 对齐。Ascend C 内核使用 HCOMM、UBMEM 和 URMA 完成通信，并通过 [DeepJIT](https://github.com/deepseek-ai/DeepJIT) 在运行时编译。
 
-**(English introduction)** [DeepEP-Ascend](https://github.com/deepseek-ai/DeepEP-Ascend) is a high-performance communication library for machine learning training and inference on Huawei Ascend NPUs. It provides expert-parallel (EP) all-to-all operations for MoE dispatch and combine, including FP8 dispatch and deferred epilogues. It also offers communication primitives (work in progress) for pipeline parallelism (PP), context and data parallelism through Bucket collectives (CP/DP), and remote memory access through Engram. Its public buffer APIs are aligned with the NVIDIA version of [DeepEP](https://github.com/deepseek-ai/DeepEP). Ascend C kernels use HCCL/HCOMM, UBMEM and URMA, and are compiled at runtime through [DeepJIT](https://github.com/deepseek-ai/DeepJIT).
+**(English introduction)** [DeepEP-Ascend](https://github.com/deepseek-ai/DeepEP-Ascend) is a high-performance communication library for machine learning training and inference on Huawei Ascend NPUs. It provides expert-parallel (EP) all-to-all operations for MoE dispatch and combine, including FP8 dispatch and deferred epilogues. It also offers communication primitives (work in progress) for pipeline parallelism (PP), context and data parallelism through Bucket collectives (CP/DP), and remote memory access through Engram. Its public buffer APIs are aligned with the NVIDIA version of [DeepEP](https://github.com/deepseek-ai/DeepEP). Ascend C kernels use HCOMM, UBMEM and URMA, and are compiled at runtime through [DeepJIT](https://github.com/deepseek-ai/DeepJIT).
 
 ## Performance
 
@@ -25,9 +25,9 @@ Bandwidth ranges cover all ranks, using timings that include issue and drain but
 ### Requirements
 
 - Linux on an Ascend host with supported NPU drivers and firmware.
-- Ascend 950 (A5) with UBMEM connectivity and UBC_CTP/URMA channels between the participating ranks.
+- Ascend 950 (A5) with UBMEM and UBC_CTP/URMA within each scale-up domain; cross-domain communication additionally requires UB_RTP channels.
 - An even number of ranks for multi-rank communication.
-- CANN with Ascend C, the Bisheng compiler, HCCL and HCOMM headers/libraries.
+- CANN with Ascend C, the Bisheng compiler, HCCL headers, and HCOMM headers and libraries.
 - Python 3.10 or newer, a matching PyTorch/`torch_npu` installation, and NumPy for the tests.
 - A C++20 compiler and standard library supporting `std::format`.
 
@@ -63,10 +63,10 @@ Training, inference prefill and decoding share the same `EPBuffer` interface and
 
 | Interface | Ascend support |
 | --- | --- |
-| `EPBuffer` | Expanded BF16/FP8 dispatch, BF16 combine, cached handles, deterministic layouts, expert padding and deferred epilogues |
+| `EPBuffer` | Expanded BF16/FP8 dispatch, BF16 combine, cached handles, deterministic layouts, expert padding, deferred epilogues and expert load balancing |
 | `PPBuffer` | Send/receive between adjacent pipeline ranks |
 | `EngramBuffer` | NPU-backed BF16/FP8 tables and per-layer fetch hooks |
-| `BucketBuffer` | Batched all-gather, registered storage, multiple groups and sessions for ordinary tensors |
+| `BucketBuffer` | Batched all-gather, reduce-scatter, all-reduce, send-recv and ring send-recv, registered storage, multiple groups and sessions for ordinary tensors |
 | `BufferAllocator`, `BufferBase`, `deep_ep.comm` | Allocation planning, buffer lifecycle, communicator queries, barriers and stream access |
 
 PP, Engram and Bucket are experimental; remaining work is listed under [Ongoing](#ongoing). EP requires `do_expand=True` and `allow_multiple_reduction=True`; `do_handle_copy` must remain `False`.
@@ -77,11 +77,10 @@ Routing indices use `deep_ep.topk_idx_t`, currently fixed to `torch.int64`. Expl
 
 The Ascend backend is under active development:
 
-- Bucket collectives: batched all-gather is available; Ascend reduce-scatter and all-reduce kernels are still being built.
-- Expert load balancing: `EPBuffer.lb_prefetch_weights` and `EPBuffer.lb_reduce_grads` expose the aligned APIs, but their Ascend communication kernels are not implemented yet.
+- Bucket collectives: `reduce_scatter` and `send_recv` do not yet support hybrid domains, and `ring_send_recv` currently supports scale-up domains only.
 - PP and Engram: these interfaces remain experimental, with further correctness and performance validation ongoing.
 
-Hybrid communication, CPU-backed Engram storage and graph capture remain unsupported.
+EP hybrid communication, CPU-backed Engram storage and graph capture remain unsupported.
 
 ## EP usage in training and inference
 
@@ -195,6 +194,10 @@ output, _ = pending.wait()
 
 Training saves `handle` for `combine_backward` and `dispatch_backward`; wait on their returned events in the same way. See [EP tests](tests/ep/test_ep.py) for complete examples.
 
+### Expert load balancing
+
+`EPBuffer.lb_get_redundancy_mapping()`, `lb_prefetch_weights()` and `lb_reduce_grads()` balance expert loads and exchange redundant expert weights and FP32 gradients within a scale-up domain, using storage reserved via `lb_allocation_plan_or_num_bytes`. See [redundancy mapping tests](tests/ep/test_lb_get_redundancy_mapping.py), [weight prefetch tests](tests/ep/test_prefetch_weights.py) and [gradient reduction tests](tests/ep/test_reduce_grads.py).
+
 ## Other buffer interfaces
 
 ### Bucket all-gather
@@ -219,6 +222,20 @@ bucket.destroy()
 
 All ranks must supply equally sized shards, and the bucket must have enough space for the gathered output; sessions do not grow its storage. Outside a session, output storage must belong to the bucket; without explicit `dsts`, each input must be the local rank's shard of a registered gathered tensor. Use `BufferAllocator` to plan persistent registered storage. Batches support up to 64 tensors, and multi-group buffers select a group with `group=`. Session exit adds no barrier. See [all-gather tests](tests/bucket/test_all_gather.py) and [session tests](tests/bucket/test_session.py).
 
+### Bucket reduce-scatter and all-reduce
+
+`BucketBuffer.reduce_scatter()` and `BucketBuffer.all_reduce()` perform batched deterministic FP32 reductions and work inside sessions. See [reduce-scatter tests](tests/bucket/test_reduce_scatter.py) and [all-reduce tests](tests/bucket/test_all_reduce.py).
+
+### Bucket send-recv
+
+`BucketBuffer.send_recv(send_ops, num_sms=None, group=None)` sends registered contiguous tensor views to `(tensor, dst_rank_idx, dst_offset)` destinations. Rank indices are relative to `group`, and destination offsets are in bytes from the remote buffer's storage. Source ranges and destination offsets must be RDMA-aligned.
+
+Up to 500 send entries are accepted; empty sends are ignored. Every rank participates, including ranks with no transfers. `.wait()` completes communication and returns `None`; received data is read directly from the destination buffer views.
+
+The Ascend implementation uses `num_sms=0` (also selected by `None`) and requires `EP_AVOID_RECORD_STREAM=1`. Send-recv is unavailable inside sessions. See [send-recv tests](tests/bucket/test_send_recv.py).
+
+`BucketBuffer.ring_send_recv(srcs, dsts=None, shift=1, cyclic=False, group=None, num_sms=None)` shifts batched tensors by `shift` ranks within a scale-up domain for CP workloads and works inside sessions. See [ring send-recv tests](tests/bucket/test_ring_send_recv.py).
+
 ### Pipeline parallelism and Engram
 
 `PPBuffer` reserves send/receive storage with `num_max_tensor_bytes` and `num_max_inflight_tensors`, then provides `send(x, dst_rank_idx)` and `recv(x, src_rank_idx)` for adjacent pipeline ranks. See [PP tests](tests/pp/test_pp.py).
@@ -231,7 +248,7 @@ Set environment variables consistently on every rank, before importing the packa
 
 | Variable | Use |
 | --- | --- |
-| `EP_AVOID_RECORD_STREAM` | Required for Bucket all-gather; EP retains URMA sources through epilogue captures independently of this flag |
+| `EP_AVOID_RECORD_STREAM` | Required for Bucket operations; EP retains URMA sources through epilogue captures independently of this flag |
 | `EP_BUFFER_DEBUG` | Print EP buffer initialization diagnostics; unset to disable |
 | `EP_DISABLE_BARRIER_PROFILING` | Disable the extra per-iteration synchronization used by benchmark helpers |
 
@@ -271,9 +288,17 @@ For multiple nodes, launch the same command on each node with a shared `MASTER_A
 
 ```bash
 python tests/buffer/test_allocation.py
+python tests/buffer/test_resize.py
 python tests/comm/test_stream.py
 python tests/comm/test_barrier.py
+python tests/ep/test_lb_get_redundancy_mapping.py
+python tests/ep/test_prefetch_weights.py
+python tests/ep/test_reduce_grads.py
 python tests/bucket/test_all_gather.py
+python tests/bucket/test_reduce_scatter.py
+python tests/bucket/test_all_reduce.py
+python tests/bucket/test_send_recv.py
+python tests/bucket/test_ring_send_recv.py
 python tests/bucket/test_session.py
 python tests/pp/test_pp.py
 python tests/engram/test_engram.py

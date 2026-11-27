@@ -25,7 +25,8 @@ init_jit()
 
 # Public API
 from . import comm
-from .comm import destroy_all_managed_hccl_comm, get_physical_domain_size, get_logical_domain_size
+from .comm import (ErrorStatus, RECOVERABLE_MASK, get_logical_domain_size,
+                   get_physical_domain_size)
 from .buffers.allocator import BufferAllocator
 from .buffers.base import BufferBase
 from .buffers.ep import EPBuffer, EPHandle
@@ -39,4 +40,4 @@ from .utils.event import EventOverlap, EventHandle
 from .utils.envs import init_seed, get_local_seed, get_global_seed, dist_print, init_dist
 from .utils.testing import KernelProfile, bench_msprof
 
-__version__ = '1.0.0'
+__version__ = '1.1.0'

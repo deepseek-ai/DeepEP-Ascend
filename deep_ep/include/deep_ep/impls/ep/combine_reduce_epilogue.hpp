@@ -4,6 +4,7 @@
 
 #include <kernel_operator.h>
 #include <c_api/asc_simd.h>
+#include <c_api/scalar_compute/scalar_compute.h>
 #include <c_api/sync/sync.h>
 #include <c_api/vector_datamove/vector_datamove.h>
 
@@ -13,6 +14,7 @@
 #include <deep_ep/common/exception.hpp>
 #include <deep_ep/common/math.hpp>
 #include <deep_ep/layout/ep/workspace.hpp>
+#include <deep_ep/layout/common/context.hpp>
 
 namespace deep_ep {
 
@@ -42,44 +44,46 @@ __simd_vf__ __forceinline__ void restore_combine_weights(
     asc_storealign(ub_output, result, mask);
 }
 
-template <int kNumRanks, int kNumExperts, int kNumTopk,
+template <bool kOutputFP32, int kNumRanks, int kNumExperts, int kNumTopk,
           int kHidden, int kNumMaxTokensPerRank, int kNumUbBytes,
           int kNumVecCores, int64_t kNumTimeoutCycles, bool kDoBarrier = true,
           int kNumHiddenBytes = kHidden * static_cast<int>(sizeof(bfloat16_t))>
 __global__ __vector__ void combine_reduce_epilogue_impl(
-    __gm__ bfloat16_t* combined_x,
+    __gm__ std::conditional_t<kOutputFP32, float, bfloat16_t>* combined_x,
     __gm__ float* combined_topk_weights,
     __gm__ int64_t* combined_topk_idx,
     __gm__ bfloat16_t* buffer,
     __gm__ bfloat16_t* bias_0,
     __gm__ bfloat16_t* bias_1,
     __gm__ void* workspace,
-    __gm__ void* jetty_ptrs,
+    __gm__ void* device_context_ptr,
+    const int rank_idx,
     const int num_combined_tokens) {
     AscendC::InitSocState();
 
     const auto vec_core_idx = static_cast<int>(AscendC::GetBlockIdx());
+    auto* device_context = static_cast<__gm__ layout::DeviceContext*>(device_context_ptr);
     if constexpr (kDoBarrier)
         comm::scalar::barrier<
-            kNumRanks, kNumTimeoutCycles, true, false, true, kNumVecCores, kNumVecCores>(
-                static_cast<__gm__ layout::EPSignals*>(workspace)->common_signals, vec_core_idx, jetty_ptrs);
+            kNumRanks, kNumRanks, kNumTimeoutCycles, true, false, true, kNumVecCores, kNumVecCores>(
+                static_cast<__gm__ layout::EPSignals*>(workspace)->barrier_signals, *device_context, vec_core_idx, rank_idx);
 
     static constexpr int kNumWeightBytes = math::align(kNumTopk * static_cast<int>(sizeof(float)), kNumUbAlignmentBytes);
     static constexpr int kNumHiddenSlots = math::min(32, kNumUbBytes / (kNumHiddenBytes + kNumWeightBytes));
     static constexpr int kNumCombineTokenElems = kHidden + kNumWeightBytes / static_cast<int>(sizeof(bfloat16_t));
     using HiddenReducer = RingReducer<
-        kHidden, math::min(kNumRanks, kNumTopk) + 2, kNumHiddenSlots, 0, kNumWeightBytes>;
+        kHidden, math::min(kNumRanks, kNumTopk) + 2, kNumHiddenSlots, 0, kNumWeightBytes, kOutputFP32>;
 
     struct UBLayout {
         typename HiddenReducer::Buffer hidden;
     };
 
-    EP_STATIC_ASSERT(kNumRanks > 0 and kNumExperts % kNumRanks == 0);
+    EP_STATIC_ASSERT(kNumRanks > 0 and kNumRanks <= kNumMaxEPRanks and kNumExperts % kNumRanks == 0);
     EP_STATIC_ASSERT(kNumExperts <= kNumMaxExperts);
     EP_STATIC_ASSERT(kNumTopk > 0 and kNumTopk <= 32);
     EP_STATIC_ASSERT(kNumMaxTokensPerRank > 0);
     EP_DEVICE_ASSERT(0 <= num_combined_tokens and num_combined_tokens <= kNumMaxTokensPerRank);
-    EP_STATIC_ASSERT(math::min(kNumRanks, kNumTopk) + 2 <= kNumHiddenSlots);
+    EP_STATIC_ASSERT(math::min(kNumRanks, kNumTopk) + 2 + kOutputFP32 <= kNumHiddenSlots);
     EP_STATIC_ASSERT(sizeof(UBLayout) <= kNumUbBytes);
 
     const auto num_vec_cores = static_cast<int>(AscendC::GetBlockNum());
@@ -112,14 +116,15 @@ __global__ __vector__ void combine_reduce_epilogue_impl(
             seen_ranks[dst_rank_idx / 64] |= rank_bit;
         }
         // Load biases and rank partials in accumulation order.
+        const auto num_inputs = num_biases + static_cast<int>(asc_popc(master_slot_mask));
+        if constexpr (kOutputFP32)
+            reducer.prepare_fp32_output();
         const auto first_input_idx = reducer.slot_idx;
-        int num_inputs = 0;
         for (int bias_idx = 0; bias_idx < 2; ++ bias_idx) {
             const auto bias = bias_idx == 0 ? bias_0 : bias_1;
             if (bias != nullptr) {
                 reducer.load_next_token(bias + static_cast<int64_t>(token_idx) * kHidden,
                                         asc_load_l2_cache_mode::NOTALLOC_KEEP, 0);
-                ++ num_inputs;
             }
         }
         #pragma unroll
@@ -135,18 +140,15 @@ __global__ __vector__ void combine_reduce_epilogue_impl(
             const auto gm_input = buffer + static_cast<int64_t>(combine_slot_idx) * kNumCombineTokenElems;
             reducer.load_next_token(gm_input, asc_load_l2_cache_mode::NOTALLOC_KEEP,
                                     has_topk_weights ? kNumWeightBytes : 0);
-            ++ num_inputs;
         }
-        reducer.reduce(num_inputs);
-        if (has_topk_weights) {
-            const auto output_idx = reducer.slot_idx == 0 ? kNumHiddenSlots - 1 : reducer.slot_idx - 1;
-            restore_combine_weights<kNumTopk, HiddenReducer::kNumTokenElems, kNumHiddenSlots, kHidden>(
-                reinterpret_cast<__ubuf__ uint32_t*>(ub->hidden.buf[0]),
-                reinterpret_cast<__ubuf__ uint32_t*>(ub->hidden.buf[output_idx] + kHidden),
-                (first_input_idx + num_biases) % kNumHiddenSlots, num_inputs - num_biases);
-            asc_sync_notify(PIPE_V, PIPE_MTE3, EVENT_ID0);
-            asc_sync_wait(PIPE_V, PIPE_MTE3, EVENT_ID0);
-        }
+        reducer.reduce(num_inputs, [&](const uint32_t output_idx) __aicore__ {
+            if (has_topk_weights) {
+                restore_combine_weights<kNumTopk, HiddenReducer::kNumTokenElems, kNumHiddenSlots, kHidden>(
+                    reinterpret_cast<__ubuf__ uint32_t*>(ub->hidden.buf[0]),
+                    reinterpret_cast<__ubuf__ uint32_t*>(ub->hidden.buf[output_idx] + kHidden),
+                    (first_input_idx + num_biases) % kNumHiddenSlots, num_inputs - num_biases);
+            }
+        });
         reducer.store_last_token(combined_x + static_cast<int64_t>(token_idx) * kHidden,
             asc_store_l2_cache_mode::NOTALLOC_CLEAN,
             has_topk_weights ? reinterpret_cast<__gm__ uint8_t*>(combined_topk_weights + token_idx * kNumTopk) : nullptr,
