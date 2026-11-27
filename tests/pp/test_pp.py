@@ -76,6 +76,33 @@ def test_performance(buffer: deep_ep.PPBuffer, shape: tuple):
                f'recv: {recv_profile.us:.3f} us, {recv_profile.gbps(num_tensor_bytes):.0f} GB/s')
 
 
+def check_receive_rings(buffer: deep_ep.PPBuffer, shape: tuple, num_max_inflight_tensors: int):
+    tensor_bytes = math.prod(shape) * 2
+    rdma_alignment = deep_ep.get_num_rdma_alignment()
+    slot_bytes = (tensor_bytes + rdma_alignment - 1) // rdma_alignment * rdma_alignment
+    allocation_alignment = deep_ep.get_num_allocation_alignment()
+    ring_bytes = 2 * num_max_inflight_tensors * slot_bytes
+    storage_bytes = (ring_bytes + allocation_alignment - 1) // allocation_alignment * allocation_alignment
+    if buffer.storage.nbytes != storage_bytes:
+        raise RuntimeError(f'PP storage has {buffer.storage.nbytes} bytes, expected {storage_bytes}')
+
+    rank_idx, num_ranks = buffer.rank_idx, buffer.num_ranks
+    peers = sorted({(rank_idx + 1) % num_ranks, (rank_idx + num_ranks - 1) % num_ranks})
+    send_tensor = torch.empty(shape, dtype=torch.bfloat16, device='npu')
+    recv_tensor = torch.empty_like(send_tensor)
+    # Fill each neighbor's receive ring before publishing release credits.
+    for slot in range(num_max_inflight_tensors):
+        send_tensor.fill_(rank_idx * num_max_inflight_tensors + slot)
+        for peer in peers:
+            buffer.send(send_tensor, peer)
+    for slot in range(num_max_inflight_tensors):
+        for peer in peers:
+            buffer.recv(recv_tensor, peer)
+            expected = torch.full_like(recv_tensor, peer * num_max_inflight_tensors + slot)
+            if not torch.equal(recv_tensor, expected):
+                raise RuntimeError(f'Rank {rank_idx}: receive ring mismatch from {peer} at slot {slot}')
+
+
 # noinspection PyShadowingNames
 @torch.inference_mode()
 def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
@@ -92,6 +119,8 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                f' > Shape: {shape}\n'
                f' > Max inflight tensors: {num_max_inflight_tensors}\n',
                once_in_node=True)
+
+    check_receive_rings(buffer, shape, num_max_inflight_tensors)
 
     # Run stress tests
     dist_print('Running stress tests:', once_in_node=True)
