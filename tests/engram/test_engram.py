@@ -5,6 +5,7 @@ os.environ['TORCH_NPU_DISABLED_WARNING'] = '1'
 import argparse
 import torch
 import torch.distributed as dist
+import torch_npu
 
 import deep_ep
 from deep_ep.utils.envs import dist_print, init_dist
@@ -62,6 +63,16 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             local_storage = local_bf16
         local_storages.append(local_storage)
     buffer.write(local_storages, sfs=sfs)
+    # Check ordinary writes, then exercise the in-place loading path.
+    storage_views = buffer.get_storage_tensors()
+    for view, source, repeated in zip(storage_views, local_storages, buffer.get_storage_tensors(), strict=True):
+        assert view.shape == source.shape and view.dtype == source.dtype
+        assert view.device == source.device and view.is_contiguous()
+        assert view.data_ptr() == repeated.data_ptr()
+        assert torch_npu.get_npu_format(view) == torch_npu.get_npu_format(source)
+        assert torch.equal(view.view(torch.uint8), source.view(torch.uint8))
+        view.copy_(source)
+    buffer.write(storage_views, sfs=sfs)
 
     domain_start = rank_idx - buffer.scaleup_rank_idx
 
@@ -133,6 +144,10 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     dist_print(once_in_node=True)
 
     buffer.destroy()
+    # A live view retains the allocation after communication is destroyed.
+    for view, source in zip(storage_views, local_storages, strict=True):
+        assert torch.equal(view.view(torch.uint8), source.view(torch.uint8))
+    del view, repeated, storage_views
     dist.destroy_process_group()
 
 
