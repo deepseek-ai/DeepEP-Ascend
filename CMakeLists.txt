@@ -13,30 +13,36 @@ find_package(pybind11 REQUIRED)
 find_package(Torch REQUIRED)
 
 # NOTES: CLion can not index linked directories
+# CANN lays out arch-specific headers under aarch64-linux/ or x86_64-linux/
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    set(ASCEND_ARCH_SUBDIR aarch64-linux)
+else()
+    set(ASCEND_ARCH_SUBDIR x86_64-linux)
+endif()
 include_directories(
     csrc deep_ep/include
     third-party/clangd-ascend/include
     third-party/deep_jit/include
-    ${ASCEND_HOME_PATH}/aarch64-linux/include
-    ${ASCEND_HOME_PATH}/aarch64-linux/include/ascendc/host_apiascendc/include/highlevel_api
-    ${ASCEND_HOME_PATH}/aarch64-linux/asc/impl/adv_api
-    ${ASCEND_HOME_PATH}/aarch64-linux/asc/impl/basic_api
-    ${ASCEND_HOME_PATH}/aarch64-linux/asc/impl/c_api
-    ${ASCEND_HOME_PATH}/aarch64-linux/asc/impl/micro_api
-    ${ASCEND_HOME_PATH}/aarch64-linux/asc/impl/simt_api
-    ${ASCEND_HOME_PATH}/aarch64-linux/asc/impl/utils
-    ${ASCEND_HOME_PATH}/aarch64-linux/asc
-    ${ASCEND_HOME_PATH}/aarch64-linux/asc/include
-    ${ASCEND_HOME_PATH}/aarch64-linux/asc/include/adv_api
-    ${ASCEND_HOME_PATH}/aarch64-linux/asc/include/adv_api/matmul
-    ${ASCEND_HOME_PATH}/aarch64-linux/asc/include/aicpu_api
-    ${ASCEND_HOME_PATH}/aarch64-linux/asc/include/basic_api
-    ${ASCEND_HOME_PATH}/aarch64-linux/asc/include/c_api
-    ${ASCEND_HOME_PATH}/aarch64-linux/asc/include/interface
-    ${ASCEND_HOME_PATH}/aarch64-linux/asc/include/micro_api
-    ${ASCEND_HOME_PATH}/aarch64-linux/asc/include/simt_api
-    ${ASCEND_HOME_PATH}/aarch64-linux/asc/include/tiling
-    ${ASCEND_HOME_PATH}/aarch64-linux/asc/include/utils
+    ${ASCEND_HOME_PATH}/${ASCEND_ARCH_SUBDIR}/include
+    ${ASCEND_HOME_PATH}/${ASCEND_ARCH_SUBDIR}/include/ascendc/host_apiascendc/include/highlevel_api
+    ${ASCEND_HOME_PATH}/${ASCEND_ARCH_SUBDIR}/asc/impl/adv_api
+    ${ASCEND_HOME_PATH}/${ASCEND_ARCH_SUBDIR}/asc/impl/basic_api
+    ${ASCEND_HOME_PATH}/${ASCEND_ARCH_SUBDIR}/asc/impl/c_api
+    ${ASCEND_HOME_PATH}/${ASCEND_ARCH_SUBDIR}/asc/impl/micro_api
+    ${ASCEND_HOME_PATH}/${ASCEND_ARCH_SUBDIR}/asc/impl/simt_api
+    ${ASCEND_HOME_PATH}/${ASCEND_ARCH_SUBDIR}/asc/impl/utils
+    ${ASCEND_HOME_PATH}/${ASCEND_ARCH_SUBDIR}/asc
+    ${ASCEND_HOME_PATH}/${ASCEND_ARCH_SUBDIR}/asc/include
+    ${ASCEND_HOME_PATH}/${ASCEND_ARCH_SUBDIR}/asc/include/adv_api
+    ${ASCEND_HOME_PATH}/${ASCEND_ARCH_SUBDIR}/asc/include/adv_api/matmul
+    ${ASCEND_HOME_PATH}/${ASCEND_ARCH_SUBDIR}/asc/include/aicpu_api
+    ${ASCEND_HOME_PATH}/${ASCEND_ARCH_SUBDIR}/asc/include/basic_api
+    ${ASCEND_HOME_PATH}/${ASCEND_ARCH_SUBDIR}/asc/include/c_api
+    ${ASCEND_HOME_PATH}/${ASCEND_ARCH_SUBDIR}/asc/include/interface
+    ${ASCEND_HOME_PATH}/${ASCEND_ARCH_SUBDIR}/asc/include/micro_api
+    ${ASCEND_HOME_PATH}/${ASCEND_ARCH_SUBDIR}/asc/include/simt_api
+    ${ASCEND_HOME_PATH}/${ASCEND_ARCH_SUBDIR}/asc/include/tiling
+    ${ASCEND_HOME_PATH}/${ASCEND_ARCH_SUBDIR}/asc/include/utils
     ${TORCH_INCLUDE_DIRS} ${PYTHON_INCLUDE_DIRS}
     ${TORCH_NPU_INSTALL_PREFIX}/include ${TORCH_NPU_INSTALL_PREFIX}/include/third_party/acl/inc
 )

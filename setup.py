@@ -1,6 +1,7 @@
 import ast
 import re
 import os
+import platform
 import shutil
 import subprocess
 import setuptools
@@ -62,6 +63,13 @@ def get_ascend_home():
     return ascend_home
 
 
+def get_ascend_arch_subdir():
+    # CANN lays out arch-specific headers under `aarch64-linux/` or `x86_64-linux/`
+    # inside the toolkit home; pick the one matching the host architecture.
+    machine = platform.machine().lower()
+    return 'aarch64-linux' if machine.startswith('aarch64') or machine == 'arm64' else 'x86_64-linux'
+
+
 class CustomBuildPy(build_py):
     def run(self):
         # Make clusters' cache setting default into `envs.py`
@@ -96,6 +104,7 @@ class CustomBuildPy(build_py):
 
 if __name__ == '__main__':
     ascend_home = get_ascend_home()
+    ascend_arch_dir = f'{ascend_home}/{get_ascend_arch_subdir()}'
     torch_npu_dir = os.path.dirname(torch_npu.__file__)
     package_dir = Path(current_dir) / 'deep_ep'
 
@@ -114,10 +123,10 @@ if __name__ == '__main__':
         f'{current_dir}/csrc',
         f'{current_dir}/deep_ep/include',
         f'{current_dir}/third-party/deep_jit/include',
-        f'{ascend_home}/aarch64-linux/include',
+        f'{ascend_arch_dir}/include',
         # TODO(HUAWEI): cleanup include paths
-        f'{ascend_home}/aarch64-linux/asc',
-        f'{ascend_home}/aarch64-linux/asc/include',
+        f'{ascend_arch_dir}/asc',
+        f'{ascend_arch_dir}/asc/include',
         f'{torch_npu_dir}/include',
         f'{torch_npu_dir}/include/third_party/acl/inc',
     ] + torch_include_paths()
